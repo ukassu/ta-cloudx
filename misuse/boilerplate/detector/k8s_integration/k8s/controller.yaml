@@ -17,6 +17,7 @@ spec:
       containers:
         - name: controller
           image: REPLACE_ME/detector-controller:latest
+          imagePullPolicy: IfNotPresent
           env:
             - name: TARGET_NAMESPACE
               value: "testbed-jobs"

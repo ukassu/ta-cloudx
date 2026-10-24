@@ -98,3 +98,25 @@ Bagian di atas sengaja dibiarkan `TODO`/`NotImplementedError` karena
 memang tempat riset Anda berada — boilerplate ini hanya menjamin
 bagian di SEKITARNYA (loading, saving, evaluasi, alur data) sudah
 konsisten dan tidak perlu ditulis ulang tiap kali ganti pendekatan.
+
+### Prometheus pada daemon scorer
+
+`k8s_integration/daemon_scorer/main.py` mengambil data dari Prometheus
+HTTP API. Manifest sudah menggunakan `imagePullPolicy: IfNotPresent`,
+sehingga image lokal yang sudah di-load ke kind tidak dipaksa di-pull
+ulang. Sesuaikan endpoint jika nama Service Prometheus di cluster
+berbeda:
+
+```yaml
+- name: PROMETHEUS_URL
+  value: "http://prometheus-operated.monitoring.svc:9090"
+```
+
+Dengan `FEATURE_MODE=aggregate`, scorer mengambil window
+`PROMETHEUS_WINDOW_SEC` dan menghasilkan urutan fitur yang sama seperti
+`aggregate_sessions()` untuk kolom tanpa GPU:
+`cpu_pct`, `mem_rss_mb`, `io_read_mb`, dan `io_write_mb`, masing-masing
+dengan statistik mean/std/max/min. `PROMETHEUS_STEP_SEC` mengatur
+resolusi query range. Jika metrik tidak tersedia untuk suatu Pod,
+scorer mencatat error dan mencoba lagi pada siklus berikutnya, bukan
+menulis skor palsu.

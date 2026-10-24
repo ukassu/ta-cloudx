@@ -20,6 +20,7 @@ spec:
       containers:
         - name: daemon-scorer
           image: REPLACE_ME/detector-daemon-scorer:latest
+          imagePullPolicy: IfNotPresent
           env:
             - name: NODE_NAME
               valueFrom:
@@ -36,6 +37,12 @@ spec:
               value: "testbed-jobs"
             - name: POLL_INTERVAL_SEC
               value: "15"
+            - name: PROMETHEUS_URL
+              value: "http://prometheus-operated.monitoring.svc:9090"
+            - name: PROMETHEUS_WINDOW_SEC
+              value: "60"
+            - name: PROMETHEUS_STEP_SEC
+              value: "15"
           volumeMounts:
             - name: model
               mountPath: /model
@@ -44,3 +51,31 @@ spec:
         - name: model
           configMap:
             name: detector-model  # TODO: sesuaikan cara distribusi model
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: detector-pod-labeler
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: detector-pod-labeler
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: detector-pod-labeler
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: detector-pod-labeler
+subjects:
+  - kind: ServiceAccount
+    name: detector-pod-labeler
+    namespace: default

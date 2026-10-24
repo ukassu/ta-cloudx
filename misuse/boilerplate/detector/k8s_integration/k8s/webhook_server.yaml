@@ -16,6 +16,7 @@ spec:
       containers:
         - name: webhook
           image: REPLACE_ME/detector-webhook-server:latest
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8443
           env:
