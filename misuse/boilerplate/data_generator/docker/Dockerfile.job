@@ -9,13 +9,20 @@
 #   cd data_generator
 #   docker build -f docker/Dockerfile.job -t local/data-generator-job:latest .
 #   kind load docker-image local/data-generator-job:latest --name <nama-cluster>
+#
+# Varian GPU (torch CUDA; driver & nvidia-smi disuntik runtime NVIDIA node):
+#   docker build -f docker/Dockerfile.job \
+#     --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu126 \
+#     -t local/data-generator-job:gpu .
 # ============================================================================
 FROM python:3.11-slim
+
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 
 WORKDIR /app
 
 RUN pip install --no-cache-dir \
-    torch --index-url https://download.pytorch.org/whl/cpu 
+    torch --index-url ${TORCH_INDEX_URL}
 RUN pip install psutil pandas numpy
 
 COPY scenario_base.py registry.py telemetry_sidecar.py /app/

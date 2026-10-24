@@ -13,7 +13,7 @@ import time
 
 import torch
 
-from scenario_base import Scenario
+from scenario_base import Scenario, touch_activity
 from registry import register
 
 
@@ -24,6 +24,7 @@ def main():
     ap.add_argument("--matrix-size", type=int, default=2048)
     args = ap.parse_args()
 
+    touch_activity()  # hanya saat diluncurkan
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     a = torch.randn(args.matrix_size, args.matrix_size, device=device)
     b = torch.randn(args.matrix_size, args.matrix_size, device=device)
@@ -49,7 +50,10 @@ register(Scenario(
     script_path="scenarios/misuse_disguised_pattern.py",
     default_args=["--duration-sec", "1800", "--period-sec", "60"],
     timeout_sec=1830,
-    description="Osilasi GPU mirip siklus training, tapi periodisitas terlalu reguler, tanpa I/O.",
+    description="Osilasi GPU mirip siklus training, tapi periodisitas terlalu reguler, "
+                "tanpa I/O (cryptomining tersembunyi).",
+    code="S1",
+    label_class="K3",
 ))
 
 

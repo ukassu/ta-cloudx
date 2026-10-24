@@ -10,7 +10,7 @@ import time
 import numpy as np
 import pandas as pd
 
-from scenario_base import Scenario
+from scenario_base import Scenario, touch_activity
 from registry import register
 
 
@@ -29,6 +29,7 @@ def main():
         df["group"] = np.random.randint(0, 20, size=len(df))
         _ = df.groupby("group").agg(["mean", "std", "max"])
         _ = df.corr()
+        touch_activity()
         time.sleep(1)
 
     print("[benign_eda_notebook] selesai.")
@@ -41,6 +42,7 @@ register(Scenario(
     default_args=["--duration-sec", "300"],
     timeout_sec=None,
     description="CPU tinggi, GPU nyaris 0% -- penyeimbang kelas benign non-GPU.",
+    sibling_sessions=1,  # 2 sesi paralel: masih di dalam batas kebijakan (R6 = 4)
 ))
 
 

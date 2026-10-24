@@ -56,5 +56,7 @@ def discover_scenarios(package_name: str = "scenarios"):
     """
     package = importlib.import_module(package_name)
     for _, module_name, _ in pkgutil.iter_modules(package.__path__):
+        if module_name.startswith("template_"):
+            continue  # kerangka salinan, bukan skenario sungguhan
         importlib.import_module(f"{package_name}.{module_name}")
     return all_scenarios()

@@ -8,7 +8,9 @@ metadata skenario (termasuk timeout_sec bawaan skenario) konsisten
 dipakai tanpa duplikasi di run_experiment.py.
 """
 
+import os
 import subprocess
+import sys
 import time
 
 from scenario_base import Scenario
@@ -40,7 +42,15 @@ def run_labeled_job(scenario: Scenario, session_id: str, out_dir="data",
     args = args_override if args_override is not None else scenario.default_args
     out_path = f"{out_dir}/{session_id}.csv"
 
-    proc = subprocess.Popen(["python", scenario.script_path] + args)
+    env = os.environ.copy()
+    module_dir = os.path.dirname(os.path.abspath(__file__))
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (module_dir, env.get("PYTHONPATH", "")) if part
+    )
+    proc = subprocess.Popen(
+        [sys.executable, scenario.script_path] + args,
+        env=env,
+    )
     logger = TelemetryLogger(
         root_pid=proc.pid, session_id=session_id, label=scenario.label,
         job_type=scenario.name, out_path=out_path, interval_sec=interval_sec,

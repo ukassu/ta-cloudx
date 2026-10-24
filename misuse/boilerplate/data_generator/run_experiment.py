@@ -13,13 +13,27 @@ Contoh pemakaian:
 """
 
 import argparse
+import dataclasses
 import glob
+import json
 import os
 import random
 
 import pandas as pd
 
 from registry import discover_scenarios, all_scenarios, get
+
+# Kebijakan sandbox untuk baseline berbasis aturan (R2 idle, R6 sesi, R3
+# kuota) -- ditulis ke <out-dir>/policy.json. Skala waktu dikompresi agar
+# sesi 5 menit bisa melampaui ambang idle; sesuaikan dengan konfigurasi
+# idle culler CloudX bila sudah tersedia (Kajian CATS, Bagian 6.4).
+POLICY = {
+    "idle_timeout_sec": 120,
+    "max_concurrent_sessions": 2,
+    "gpu_mem_quota_mb": 512,
+}
+# ID pengguna pseudonim (Kajian CATS, Bagian 6.3)
+USER_POOL = [f"u{i:02d}" for i in range(1, 9)]
 
 
 def main():
@@ -31,6 +45,9 @@ def main():
     ap.add_argument("--scenarios", default=None,
                      help="daftar nama skenario dipisah koma (default: SEMUA "
                           "skenario yang terdaftar di scenarios/)")
+    ap.add_argument("--duration-sec", type=int, default=None,
+                     help="ganti nilai --duration-sec di default_args setiap "
+                          "skenario yang memilikinya (mis. 120 untuk uji cepat)")
     ap.add_argument("--executor", choices=["local", "k8s"], default="local",
                      help="'local': subprocess di mesin ini (job_runner.py). "
                           "'k8s': submit Pod ke cluster kind aktif "
@@ -61,7 +78,22 @@ def main():
           f"{[s.name for s in scenarios]}")
 
     os.makedirs(args.out_dir, exist_ok=True)
+    with open(os.path.join(args.out_dir, "policy.json"), "w") as f:
+        json.dump(POLICY, f, indent=2)
     run_idx = 0
+
+    def with_duration(scenario):
+        """Terapkan --duration-sec; timeout ikut diperpanjang agar runner
+        tidak berhenti menunggu sebelum job selesai."""
+        job_args = list(scenario.default_args)
+        if args.duration_sec is not None and "--duration-sec" in job_args:
+            duration = int(args.duration_sec * scenario.duration_scale)
+            job_args[job_args.index("--duration-sec") + 1] = str(duration)
+            scenario = dataclasses.replace(
+                scenario,
+                timeout_sec=max(scenario.timeout_sec or 0, duration + 30),
+            )
+        return scenario, job_args
 
     for repeat in range(args.repeats):
         order = scenarios[:]
@@ -69,17 +101,26 @@ def main():
         for scenario in order:
             run_idx += 1
             session_id = f"{scenario.name}_{run_idx:04d}"
+            scenario, job_args = with_duration(scenario)
             run_labeled_job(
                 scenario=scenario,
                 session_id=session_id,
                 out_dir=args.out_dir,
                 interval_sec=args.interval_sec,
+                args_override=job_args,
+                extra_meta={
+                    "user_id": random.choice(USER_POOL),
+                    "scenario_code": scenario.code,
+                    "label_class": scenario.label_class,
+                    **scenario.extra_meta,
+                },
             )
 
-    all_csvs = glob.glob(os.path.join(args.out_dir, "*.csv"))
+    all_csvs = glob.glob(os.path.join(args.out_dir, "*.merged.csv"))
     all_csvs = [f for f in all_csvs if os.path.getsize(f) > 0]
     if not all_csvs:
-        print("[run_experiment] tidak ada CSV dihasilkan, dataset gabungan dilewati.")
+        print("[run_experiment] tidak ada CSV merged dihasilkan, "
+              "dataset gabungan dilewati.")
         return
 
     df = pd.concat([pd.read_csv(f) for f in all_csvs], ignore_index=True)

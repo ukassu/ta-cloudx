@@ -26,3 +26,212 @@ run experiment
 python run_experiment.py --executor k8s --repeats 10 --out-dir data
 
 
+# ============================================================
+# Experiment dengan cluster k0s
+# ============================================================
+# Status saat ini: cluster k0s (node-cp, node-1 CPU, node-2 GPU) +
+# ingress-nginx + Prometheus/Grafana jalan. Linkerd, NetObserv, dan
+# cert-manager sedang di-scale 0 supaya hemat RAM.
+
+# ------------------------------------------------------------
+# 1. Nyalakan cluster
+# ------------------------------------------------------------
+# Setelah WSL restart, container node berhenti (RESTART_POLICY=no) tapi
+# state tetap tersimpan -- cukup jalankan up-all.sh lagi, TANPA PURGE.
+cd /home/ukass/cloudx-fp/external/cloud2023/kubernetes/setup-cluster/k0s-cluster
+./up-all.sh
+
+export KUBECONFIG=/home/ukass/cloudx-fp/external/cloud2023/kubernetes/setup-cluster/k0s-cluster/node-cp/admin.kubeconfig
+export NO_PROXY=127.0.0.1,localhost
+export no_proxy=127.0.0.1,localhost
+
+kubectl get nodes -o wide -L nvidia.com/gpu.present
+kubectl get pods -A
+# Setelah restart, node/pod sempat NotReady 1-2 menit (status lama). Tunggu:
+kubectl wait --for=condition=Ready node --all --timeout=300s
+for ns in kube-system ingress-nginx monitoring; do
+  kubectl -n $ns wait --for=condition=Ready pod --field-selector=status.phase=Running --all --timeout=300s
+done
+
+# ------------------------------------------------------------
+# 2. Pastikan Prometheus siap
+# ------------------------------------------------------------
+kubectl -n monitoring get pods
+curl http://prometheus.127.0.0.1.sslip.io/-/ready          # harus: Prometheus Server is Ready.
+# Grafana: http://grafana.127.0.0.1.sslip.io  (user admin)
+kubectl get secret monitoring-grafana -n monitoring -o jsonpath='{.data.admin-password}' | base64 -d; echo
+
+# ------------------------------------------------------------
+# 3. Environment Python (sudah ada di misuse/venv)
+# ------------------------------------------------------------
+source /home/ukass/cloudx-fp/misuse/venv/bin/activate
+# jika venv belum ada:
+#   python3 -m venv /home/ukass/cloudx-fp/misuse/venv && source /home/ukass/cloudx-fp/misuse/venv/bin/activate
+#   pip install kubernetes psutil pandas numpy scikit-learn
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# ------------------------------------------------------------
+# 4. Build image job + import ke worker k0s
+# ------------------------------------------------------------
+# WAJIB diulang setiap kali scenarios/*.py atau telemetry_sidecar.py diubah.
+# (k8s_job_runner.py & run_experiment.py jalan di host, tidak perlu rebuild.)
+cd /home/ukass/cloudx-fp/misuse/boilerplate/data_generator
+
+# a) Image GPU (DIPAKAI untuk dataset utama) -- torch CUDA, ~11 GB, import ~3 menit.
+#    Cukup ke node-2 karena hanya node-2 yang punya GPU.
+docker build -f docker/Dockerfile.job \
+  --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu126 \
+  -t local/data-generator-job:gpu .
+docker save local/data-generator-job:gpu | docker exec -i k0s-node-2 k0s ctr images import -
+
+# b) Image CPU (opsional, untuk run tanpa GPU) -- ke kedua worker
+docker build -f docker/Dockerfile.job -t local/data-generator-job:latest .
+for n in k0s-node-1 k0s-node-2; do
+  docker save local/data-generator-job:latest | docker exec -i $n k0s ctr images import -
+done
+
+docker exec k0s-node-2 k0s ctr images list -q | grep data-generator-job
+docker image prune -f      # buang layer lama hasil rebuild (image GPU besar)
+
+# ------------------------------------------------------------
+# 5. Konfigurasi runner
+# ------------------------------------------------------------
+kubectl create namespace testbed-jobs --dry-run=client -o yaml | kubectl apply -f -
+export K8S_NAMESPACE=testbed-jobs
+export IMAGE_PULL_POLICY=IfNotPresent
+# Mode GPU: container job meminta nvidia.com/gpu=1 (otomatis jalan di node-2),
+# sidecar membaca nvidia-smi -> kolom gpu_util_pct, gpu_mem_util_pct,
+# gpu_mem_used_mb_device terisi.
+export JOB_IMAGE=local/data-generator-job:gpu
+export K8S_REQUEST_GPU=true
+# Mode CPU (tanpa GPU): export JOB_IMAGE=local/data-generator-job:latest K8S_REQUEST_GPU=false
+# Prometheus di-query oleh RUNNER di host (bukan dari Pod) -> pakai URL ingress
+export PROMETHEUS_URL=http://prometheus.127.0.0.1.sslip.io
+export PROM_RATE_WINDOW=1m        # jendela rate() untuk CPU/IO/network
+export PROM_SCRAPE_LAG_SEC=25     # jeda sebelum query agar scrape terakhir masuk
+
+# ------------------------------------------------------------
+# 6. Uji cepat (sekitar 5 menit)
+# ------------------------------------------------------------
+python run_experiment.py --executor k8s --repeats 1 \
+  --scenarios benign_eda_notebook,misuse_idle_hoarding \
+  --duration-sec 90 --out-dir data-test
+
+# Cek: tiap sesi harus punya .csv, .prometheus.csv, .merged.csv
+ls data-test
+python - <<'EOF'
+import pandas as pd
+df = pd.read_csv("data-test/dataset.csv")
+cols = ["cpu_pct", "mem_rss_mb", "prom_cpu_pct", "prom_mem_rss_mb"]
+print(df.groupby("job_type")[cols].agg(["mean", "max"]).T.round(1))
+print(df.filter(like="prom_").isna().mean().round(2))
+EOF
+# Yang diharapkan (mode GPU): misuse_idle_hoarding gpu_mem_used_mb_device ~2200 MB
+# dengan gpu_util_pct rendah. Mode CPU: mem_rss_mb ~2200 MB, CPU ~0 setelah alokasi.
+#
+# Catatan GPU di WSL2 (laptop):
+#   - gpu_mem_used_mb_process selalu 0: nvidia-smi di WSL2 tidak melaporkan proses.
+#   - Metrik GPU level device ikut menghitung pemakaian GPU oleh Windows (layar),
+#     baseline sekitar 5-7% util dan ~110 MB memori. Hindari game/video saat generate.
+#   - Hanya 1 GPU: sesi berjalan satu per satu (runner memang sekuensial).
+#   - Prometheus TIDAK punya metrik GPU (DCGM exporter tidak jalan di WSL2);
+#     data GPU hanya dari nvidia-smi di sidecar.
+
+# Jika ada masalah:
+kubectl get pods -n testbed-jobs -o wide
+kubectl get events -n testbed-jobs --sort-by=.lastTimestamp
+kubectl delete pod -n testbed-jobs --all      # bersihkan Pod sisa run yang terhenti
+
+# ------------------------------------------------------------
+# 7. Generate dataset penuh
+# ------------------------------------------------------------
+# 15 skenario (5 benign + 10 misuse, kode taksonomi CATS R1-R7, P5, S1):
+#   python -c 'from registry import discover_scenarios as d; [print(s.name, s.code, s.label_class) for s in d()]'
+# --duration-sec menyamakan durasi semua skenario (timeout ikut menyesuaikan);
+# P5 (misuse_gpu_monopolization) otomatis 3x lebih lama.
+#   --duration-sec 300 -> ~1 jam 40 menit per putaran (~16 jam untuk 10 putaran)
+#   --duration-sec 180 -> ~1 jam per putaran        (~10 jam untuk 10 putaran)
+# Overhead tiap sesi ~45 detik (start Pod + jeda scrape Prometheus).
+# Bisa dicicil per kelompok skenario dengan --scenarios a,b,c ke out-dir berbeda.
+# Pastikan env mode GPU dari langkah 5 sudah di-export di terminal ini.
+# Pakai out-dir BARU tiap run: session_id mulai lagi dari 0001 dan
+# dataset.csv menggabungkan SEMUA *.merged.csv di folder itu.
+# Jalankan di background supaya tidak putus saat terminal ditutup:
+nohup python run_experiment.py --executor k8s --repeats 10 \
+  --duration-sec 300 --out-dir data-k0s-$(date +%Y%m%d) > run.log 2>&1 &
+tail -f run.log
+kubectl get pods -n testbed-jobs -w             # pantau Pod yang sedang jalan
+
+# Output per sesi:
+#   <session>.csv             telemetri psutil dari sidecar
+#   <session>.prometheus.csv  query_range Prometheus (step = --interval-sec)
+#   <session>.merged.csv      gabungan berdasarkan timestamp (dipakai dataset.csv)
+#   policy.json               ambang kebijakan sandbox (idle, batas sesi, kuota)
+#
+# Kolom label & konteks (lihat README data_generator, "Skenario dan taksonomi CATS"):
+#   label (benign/misuse), scenario_code (BENIGN/R1../P5/S1), label_class (-/K1/K2/K3),
+#   user_id, session_age_sec, last_activity_age_sec, gpu_alloc_sec,
+#   prom_queue_length, prom_queue_wait_max_sec, prom_user_active_sessions
+# Antrean (queue) hanya terisi di mode GPU: runner membuat Pod "waiter-*" yang
+# Pending karena GPU dipegang sesi. Sesi paralel R6 = Pod "session-*-sib-N".
+# Jika run dihentikan paksa, bersihkan sisa Pod: kubectl delete pod -n testbed-jobs --all
+#
+# Cek cepat sinyal per skenario setelah run:
+python - <<'EOF'
+import glob, pandas as pd
+d = sorted(glob.glob("data-k0s-*"))[-1]
+df = pd.read_csv(f"{d}/dataset.csv")
+cols = ["gpu_util_pct", "gpu_mem_used_mb_device", "cpu_pct", "last_activity_age_sec",
+        "prom_queue_length", "prom_queue_wait_max_sec", "prom_user_active_sessions"]
+print(df.groupby(["scenario_code", "job_type"])[cols].mean().round(1).to_string())
+EOF
+
+# ------------------------------------------------------------
+# 8. Ambil metrik Prometheus secara manual (opsional)
+# ------------------------------------------------------------
+# Data Pod tetap ada di Prometheus setelah Pod dihapus (retensi default 10 hari),
+# jadi sesi lama bisa di-query ulang. Nama Pod = session-<session_id dengan _ jadi ->.
+P=http://prometheus.127.0.0.1.sslip.io
+POD=session-misuse-idle-hoarding-0002
+
+# Nilai sesaat
+curl -sG $P/api/v1/query --data-urlencode \
+  "query=sum(container_memory_working_set_bytes{namespace=\"testbed-jobs\",pod=\"$POD\",container=\"job\"})/1024/1024"
+
+# Rentang waktu (time series), step 5 detik, 1 jam terakhir
+curl -sG $P/api/v1/query_range \
+  --data-urlencode "query=100*sum(rate(container_cpu_usage_seconds_total{namespace=\"testbed-jobs\",pod=\"$POD\",container=\"job\"}[1m]))" \
+  --data-urlencode "start=$(date -d '-1 hour' +%s)" \
+  --data-urlencode "end=$(date +%s)" \
+  --data-urlencode "step=5"
+
+# Daftar Pod sesi yang pernah tercatat
+curl -sG $P/api/v1/label/pod/values --data-urlencode 'match[]={namespace="testbed-jobs"}'
+
+# Query yang dipakai runner ada di PROMETHEUS_QUERIES (k8s_job_runner.py).
+# Catatan kolom:
+#   - CPU/memory/IO/restart/request/limit: container "job" saja (sidecar tidak ikut).
+#   - network: per Pod. Skenario saat ini tidak memakai jaringan -> nilainya ~0.
+#   - prom_cpu/mem request/limit selalu kosong (Pod tidak memasang requests/limits).
+#   - io lokal (io_read_mb) = KUMULATIF MB; prom_io_read_mb = LAJU MB/s.
+#   - prom_cpu_pct = rata-rata 1 menit -> tertinggal dibanding cpu_pct psutil.
+
+# ------------------------------------------------------------
+# 9. Selesai eksperimen
+# ------------------------------------------------------------
+cd /home/ukass/cloudx-fp/external/cloud2023/kubernetes/setup-cluster/k0s-cluster
+./down-all.sh                 # stop node, state & Prometheus tetap ada (lanjut lagi dengan up-all.sh)
+# PURGE=yes ./down-all.sh     # reset TOTAL: semua tools supporting harus dipasang ulang
+
+# ------------------------------------------------------------
+# Menyalakan lagi tools supporting yang sedang di-scale 0
+# ------------------------------------------------------------
+# Linkerd
+kubectl -n linkerd scale deploy --all --replicas=1
+linkerd viz install | kubectl apply -f -
+# NetObserv
+kubectl -n cert-manager scale deploy --all --replicas=1
+kubectl -n netobserv scale sts/netobserv-loki --replicas=1
+kubectl -n netobserv-privileged patch ds netobserv-ebpf-agent --type json \
+  -p '[{"op":"remove","path":"/spec/template/spec/nodeSelector/paused"}]'
+kubectl -n netobserv scale deploy/netobserv-controller-manager --replicas=1

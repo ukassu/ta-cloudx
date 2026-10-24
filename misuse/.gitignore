@@ -1,1 +1,5 @@
 venv/
+# output dataset & log run_experiment.py (besar, dihasilkan ulang)
+boilerplate/data_generator/data*/
+boilerplate/data_generator/run.log
+__pycache__/
