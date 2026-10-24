@@ -9,6 +9,7 @@ NODE_DIR="${NODE_DIR:-$(pwd)}"
 NODE_NAME="${NODE_NAME:-$(basename "${NODE_DIR}")}"   # node name = folder name
 CONTAINER_NAME="${CONTAINER_NAME:-${CONTAINER_PREFIX}${NODE_NAME}}"
 WORKER_LABELS="${WORKER_LABELS:-}"                # e.g. lab/tier=general
+PUBLISH_PORTS="${PUBLISH_PORTS:-}"                # docker -p specs, e.g. 127.0.0.1:8080:80
 
 # === GPU ===
 GPU_MODE="${GPU_MODE:-auto}"                # auto: GPU node if a GPU is detected and passthrough works

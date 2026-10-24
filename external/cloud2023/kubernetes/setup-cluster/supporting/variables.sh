@@ -1,4 +1,3 @@
 HOST_IP=127.0.0.1
-HOST_IP=10.28.84.254
 
 export HOST_IP

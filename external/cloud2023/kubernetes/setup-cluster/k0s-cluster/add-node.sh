@@ -28,6 +28,9 @@ mkdir "${ROOT_DIR}/${NAME}"
 cp "${ROOT_DIR}/${TEMPLATE}/up.sh" "${ROOT_DIR}/${TEMPLATE}/down.sh" \
    "${ROOT_DIR}/${TEMPLATE}/variables.sh" "${ROOT_DIR}/${NAME}/"
 sed -i -E "s/^GPU_MODE=.*/GPU_MODE=\"\\\${GPU_MODE:-${MODE}}\"/" "${ROOT_DIR}/${NAME}/variables.sh"
+# labels and published ports are per node (host ports cannot be shared)
+sed -i -E -e 's/^WORKER_LABELS=.*/WORKER_LABELS="${WORKER_LABELS:-}"/' \
+    -e 's/^PUBLISH_PORTS=.*/PUBLISH_PORTS="${PUBLISH_PORTS:-}"/' "${ROOT_DIR}/${NAME}/variables.sh"
 chmod +x "${ROOT_DIR}/${NAME}"/*.sh
 log "created ${NAME}/ from ${TEMPLATE}/ (GPU_MODE=${MODE})"
 log "start it with: ./${NAME}/up.sh"

@@ -87,16 +87,24 @@ set -- run -d \
     -v "${ETC_DIR}:/etc/k0s" \
     -v "${LOG_DIR}:/var/log/pods" \
     -v /lib/modules:/lib/modules:ro
+for p in ${PUBLISH_PORTS:-}; do set -- "$@" -p "${p}"; done
 if [ "${GPU_NODE}" = "yes" ]; then
     set -- "$@" --gpus "\"device=${GPU_UUIDS}\"" \
         -e "GPU_STRICT_ISOLATION=${GPU_STRICT_ISOLATION}" \
         -e "GPU_NO_CGROUPS=${GPU_NO_CGROUPS}"
+    # WSL2: the nested toolkit looks for libdxcore/libnvidia-ml in /usr/lib/wsl/lib
+    if [ -d /usr/lib/wsl/lib ]; then set -- "$@" -v /usr/lib/wsl/lib:/usr/lib/wsl/lib:ro; fi
 fi
 if [ -n "${NODE_MEMORY}" ]; then set -- "$@" --memory "${NODE_MEMORY}"; fi
 if [ -n "${NODE_CPUS}" ]; then set -- "$@" --cpus "${NODE_CPUS}"; fi
 set -- "$@" "${NODE_IMAGE}" k0s worker --token-file=/etc/k0s/worker.token --profile=docker
 if [ -n "${NODE_LABELS}" ]; then set -- "$@" --labels="${NODE_LABELS}"; fi
 docker "$@" >/dev/null
+# shared root, as in kind: pods with mountPropagation (node-exporter, gadget, eBPF agents) need it.
+# debugfs/tracefs: eBPF tracepoints (NetObserv agent, Inspektor Gadget) are attached through them.
+docker exec "${CONTAINER_NAME}" sh -c 'mount --make-rshared /
+    grep -q " /sys/kernel/debug debugfs " /proc/mounts || mount -t debugfs debugfs /sys/kernel/debug
+    grep -q " /sys/kernel/tracing tracefs " /proc/mounts || mount -t tracefs tracefs /sys/kernel/tracing'
 log "${CONTAINER_NAME} started"
 
 # === Wait for registration and readiness ===

@@ -8,7 +8,8 @@ ROOT_DIR="${ROOT_DIR:-$(cd .. && pwd)}"
 NODE_DIR="${NODE_DIR:-$(pwd)}"
 NODE_NAME="${NODE_NAME:-$(basename "${NODE_DIR}")}"   # node name = folder name
 CONTAINER_NAME="${CONTAINER_NAME:-${CONTAINER_PREFIX}${NODE_NAME}}"
-WORKER_LABELS="${WORKER_LABELS:-}"                # e.g. lab/tier=general
+WORKER_LABELS="${WORKER_LABELS:-ingress-ready=true}"  # ingress-nginx (supporting/3-install-ingress.sh) runs here
+PUBLISH_PORTS="${PUBLISH_PORTS:-127.0.0.1:80:80 127.0.0.1:443:443}"  # docker -p specs; ingress hostPorts -> host
 
 # === GPU ===
 GPU_MODE="${GPU_MODE:-off}"                 # off: on a single-GPU host the GPU is reserved for node-2
