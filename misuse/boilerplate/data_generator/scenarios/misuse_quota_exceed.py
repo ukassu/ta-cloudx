@@ -1,18 +1,17 @@
 """
 scenarios/misuse_quota_exceed.py
 ===================================
-Job MISUSE: melebihi kuota resmi yang seharusnya dipatuhi. Berbeda
-dari skenario lain di folder ini, skenario ini menghasilkan METADATA
-TAMBAHAN (claimed_quota_mb) yang perlu ditangkap runner/telemetry
-logger di luar kolom numerik standar -- lihat catatan `extra_meta` di
-job_runner.py.
+Job MISUSE R3 (K2): melebihi kuota memori yang ditetapkan. Setiap sesi
+punya kuota (kolom quota_mem_mb); skenario ini sengaja mengalokasikan
+memori GPU 1.3-1.8x kuota tersebut, mensimulasikan proses yang
+mem-bypass mekanisme quota enforcement.
 """
 import argparse
 import time
 
 import torch
 
-from scenario_base import Scenario, touch_activity
+from scenario_base import LogWriter, Scenario, add_common_args, session_quota, touch_activity
 from registry import register
 
 
@@ -22,7 +21,10 @@ def main():
     ap.add_argument("--claimed-quota-mb", type=int, default=512)
     # 4x kuota; 2048 MB agar muat di node WSL (~3.7 GB RAM bebas)
     ap.add_argument("--actual-alloc-mb", type=int, default=2048)
+    ap.add_argument("--matrix-size", type=int, default=1024)
+    add_common_args(ap)
     args = ap.parse_args()
+    log = LogWriter(args.log_every_sec, args.log_kb)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # SENGAJA tidak membatasi diri ke claimed_quota_mb -- mensimulasikan
@@ -35,13 +37,14 @@ def main():
     except RuntimeError:
         bypass_success = False
 
-    a = torch.randn(1024, 1024, device=device)
-    b = torch.randn(1024, 1024, device=device)
+    a = torch.randn(args.matrix_size, args.matrix_size, device=device)
+    b = torch.randn(args.matrix_size, args.matrix_size, device=device)
     start = last_touch = time.time()
     touch_activity()
     while time.time() - start < args.duration_sec:
         _ = a @ b
         time.sleep(0.5)
+        log.tick()
         if time.time() - last_touch >= 10:
             touch_activity()
             last_touch = time.time()
@@ -57,10 +60,18 @@ register(Scenario(
     default_args=["--duration-sec", "300", "--claimed-quota-mb", "512",
                     "--actual-alloc-mb", "2048"],
     timeout_sec=320,
-    description="Alokasi GPU memory jauh melebihi claimed_quota_mb (kolom CSV).",
+    description="Alokasi memori GPU 1.3-1.8x kuota sesi (quota_mem_mb).",
     code="R3",
     label_class="K2",
-    extra_meta={"claimed_quota_mb": 512},
+    params={
+        "duration_sec": (180, 480),
+        "claimed_quota_mb": session_quota(),
+        # melampaui kuota, dibatasi 90% memori GPU agar tidak OOM
+        "actual_alloc_mb": lambda rng, ctx: int(min(
+            ctx["quota_mem_mb"] * rng.uniform(1.3, 1.8), 0.9 * ctx["mem_budget_mb"])),
+        "matrix_size": [512, 1024, 2048],
+    },
+    queue_waiters=(0, 1),
 ))
 
 

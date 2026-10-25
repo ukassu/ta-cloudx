@@ -3,9 +3,9 @@ scenarios/benign_data_pipeline_training.py
 =============================================
 Job BENIGN: training dengan pipeline data nyata -- shard dataset dibaca
 dari disk, diaugmentasi di CPU, lalu dilatih di GPU; tiap epoch ditutup
-evaluasi dan checkpoint. Utilisasi GPU turun saat fase data loading
-dan I/O baca muncul berkala. Pembanding untuk R1 ("periksa fase data
-loading") dan R7: penurunan GPU di sini singkat dan sah.
+evaluasi dan (opsional) checkpoint. Utilisasi GPU turun saat fase data
+loading dan I/O baca muncul berkala. Pembanding untuk R1 ("periksa fase
+data loading") dan R7: penurunan GPU di sini singkat dan sah.
 """
 import argparse
 import os
@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from scenario_base import Scenario, touch_activity
+from scenario_base import LogWriter, Scenario, add_common_args, touch_activity
 from registry import register
 
 DATA_DIR = "/tmp/dataset"
@@ -47,7 +47,11 @@ def main():
     ap.add_argument("--shards", type=int, default=8)
     ap.add_argument("--samples-per-shard", type=int, default=2048)
     ap.add_argument("--batch-size", type=int, default=128)
+    ap.add_argument("--checkpoint-every", type=int, default=1,
+                    help="checkpoint tiap N epoch (0 = tidak pernah)")
+    add_common_args(ap)
     args = ap.parse_args()
+    log = LogWriter(args.log_every_sec, args.log_kb)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     touch_activity()
@@ -78,11 +82,13 @@ def main():
                 loss_fn(model(x), y).backward()
                 opt.step()
             touch_activity()
+            log.tick()
         model.eval()
         with torch.no_grad():   # fase evaluasi
             for _ in range(20):
                 model(torch.randn(args.batch_size, 3, 32, 32, device=device))
-        torch.save(model.state_dict(), "/tmp/ckpt_last.pt")
+        if args.checkpoint_every > 0 and (epoch + 1) % args.checkpoint_every == 0:
+            torch.save(model.state_dict(), "/tmp/ckpt_last.pt")
         print(f"[benign_data_pipeline_training] epoch={epoch}")
         epoch += 1
 
@@ -96,7 +102,14 @@ register(Scenario(
     default_args=["--duration-sec", "600"],
     timeout_sec=None,
     description="GPU tinggi dengan dip berkala saat baca shard dari disk + "
-                "augmentasi CPU; I/O baca periodik, checkpoint tiap epoch.",
+                "augmentasi CPU; I/O baca periodik.",
+    params={
+        "duration_sec": (180, 900),
+        "shards": (4, 12),
+        "samples_per_shard": (1024, 4096),
+        "batch_size": [64, 128, 256],
+        "checkpoint_every": [0, 1, 2],
+    },
     queue_waiters=(0, 2),
 ))
 

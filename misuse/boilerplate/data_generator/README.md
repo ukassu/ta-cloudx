@@ -26,21 +26,23 @@ untuk detector.
 
 | Skenario | Kode | Kelas | Pola simulasi | Konteks dari runner |
 |----------|------|-------|---------------|---------------------|
-| benign_cnn_training | BENIGN | - | GPU siklik per epoch, checkpoint | antrean 0-2 |
-| benign_eda_notebook | BENIGN | - | CPU pandas, GPU ~0 | 2 sesi paralel (di bawah batas) |
-| benign_interactive_gpu_notebook | BENIGN | - | burst per cell + jeda berpikir 5-60 s | antrean 0-1 |
+| benign_cnn_training | BENIGN | - | GPU siklik per epoch, checkpoint opsional | antrean 0-2 |
+| benign_eda_notebook | BENIGN | - | CPU pandas, GPU ~0 | 0-1 sesi paralel (di bawah batas) |
+| benign_interactive_gpu_notebook | BENIGN | - | burst per cell + jeda berpikir | antrean 0-1, 0-1 sesi paralel |
 | benign_data_pipeline_training | BENIGN | - | baca shard dari disk, dip GPU saat data loading | antrean 0-2 |
-| benign_batch_inference | BENIGN | - | burst GPU per batch, I/O tulis | antrean 0-1 |
-| misuse_idle_hoarding | R1 | K2 | VRAM ditahan, util ~0, keep-alive sesekali | antrean 1-3 |
-| misuse_idle_session | R2 | K2 | aktif ~15% awal sesi lalu kernel idle | antrean 0-1 |
-| misuse_quota_exceed | R3 | K2 | VRAM 4x `claimed_quota_mb` | - |
-| misuse_overprovisioning | R4 | K1 | request 6 CPU / 4 GiB, pakai < 0.5 core | - |
+| benign_batch_inference | BENIGN | - | burst GPU per batch, tulis prediksi opsional | antrean 0-1 |
+| misuse_idle_hoarding | R1 | K2 | VRAM 30-60% ditahan, util ~0, keep-alive | antrean 1-3 |
+| misuse_idle_session | R2 | K2 | aktif 10-35% awal sesi lalu kernel idle | antrean 0-1 |
+| misuse_quota_exceed | R3 | K2 | VRAM 1.3-1.8x `quota_mem_mb` sesi | antrean 0-1 |
+| misuse_overprovisioning | R4 | K1 | request 4-8 CPU / 3-4 GiB, pakai < 0.5 core | - |
 | misuse_zombie_job | R5 | K2 | flat, tanpa aktivitas sejak awal | - |
-| misuse_concurrent_sessions | R6 | K2 | sesi wajar + 3 sesi paralel (4 > batas 2) | 3 sibling |
+| misuse_concurrent_sessions | R6 | K2 | sesi wajar + 2-4 sesi paralel (> batas 2) | sibling |
 | misuse_inefficient_gpu | R7 | K1 | preprocessing Python 1 thread, GPU rendah, CPU penuh | antrean 0-2 |
-| misuse_gpu_monopolization | P5 | K2 | training intensif 3x lebih lama | antrean 2-4 bertahap |
-| misuse_synthetic_load | S1 | K3 | GPU ~100% flat, tanpa aktivitas | - |
-| misuse_disguised_pattern | S1 | K3 | osilasi GPU teratur, tanpa I/O | - |
+| misuse_gpu_monopolization | P5 | K2 | training intensif 600-1200 s | antrean 2-4 bertahap |
+| misuse_synthetic_load | S1 | K3 | GPU 70-100% flat, tanpa aktivitas | - |
+| misuse_disguised_pattern | S1 | K3 | osilasi GPU teratur, tanpa aktivitas | - |
+
+Rentang parameter lengkap ada di `params` tiap file skenario.
 
 Prioritas dokumen (R1, R2, R3, R6, P5, S1) tercakup; R4, R5, R7 (K1/K2)
 disertakan sebagai pembanding sulit. Skenario benign sengaja diberi
@@ -58,9 +60,10 @@ antrean/sesi paralel kadang-kadang agar konteks bukan penanda label.
 | `prom_queue_length` | Prometheus | Pod waiter GPU yang Pending (mode GPU) |
 | `prom_queue_wait_max_sec` | Prometheus | waktu tunggu waiter terlama |
 | `prom_user_active_sessions` | Prometheus | sesi utama + sibling yang Running |
-| `claimed_quota_mb` | Scenario.extra_meta | hanya R3 |
+| `quota_mem_mb` | run_experiment | kuota memori GPU sesi (50%/75% memori GPU node), semua sesi |
+| `param_*` | run_experiment | parameter yang diundi untuk sesi ini -- ground truth, **bukan fitur** |
 
-Ambang kebijakan sandbox (idle, batas sesi, kuota) ditulis ke
+Ambang kebijakan sandbox (idle, batas sesi, memori GPU node) ditulis ke
 `<out-dir>/policy.json` untuk baseline berbasis aturan.
 
 Antrean dibuat dengan Pod "waiter" yang meminta `nvidia.com/gpu`; karena
@@ -94,18 +97,45 @@ pip install torch psutil pandas numpy
 ## Menjalankan
 
 ```bash
-# Jalankan SEMUA skenario terdaftar, 10 putaran
-python run_experiment.py --repeats 10 --out-dir data
+# Rencana 300 sesi (85% benign, 15% misuse), parameter diundi per sesi
+python run_experiment.py --executor k8s --sessions 300 --out-dir data-v2
 
-# Hanya skenario tertentu (mis. untuk uji cepat 1 skenario baru)
-python run_experiment.py --repeats 2 --scenarios misuse_idle_hoarding
+# Terputus? Lanjutkan rencana yang sama; sesi selesai dilewati
+python run_experiment.py --executor k8s --resume --out-dir data-v2
+
+# Uji cepat: 1 sesi per skenario, durasi tetap 60 s
+python run_experiment.py --executor k8s --sessions 15 --misuse-frac 0.67 \
+    --duration-sec 60 --out-dir data-test
+
+# Laporan validitas dataset (variasi, kebocoran label, konsistensi kebijakan)
+python validate_dataset.py data-v2
 
 # Uji 1 skenario secara standalone (tanpa runner/telemetry)
 python scenarios/misuse_idle_hoarding.py --duration-sec 30
 ```
 
-Output: `data/<session_id>.csv` per sesi, digabung otomatis jadi
-`data/dataset.csv` di akhir proses.
+Opsi rencana: `--sessions`, `--misuse-frac`, `--seed` (rencana identik
+untuk seed sama), `--duration-scale` (pengali durasi yang diundi),
+`--scenarios a,b` (subset). Rencana disimpan di `<out-dir>/plan.json`;
+out-dir yang sudah berisi rencana hanya bisa dilanjutkan dengan `--resume`.
+
+### Variasi per sesi (v2)
+
+Setiap skenario punya `params` (rentang parameter) yang diundi per
+sesi dengan RNG dari `--seed`, dioper sebagai argumen CLI, dan dicatat
+sebagai kolom `param_*`. Parameter memori ditulis sebagai porsi memori
+GPU node (`mem_frac`), jadi rencana menyesuaikan GPU 4 GB maupun 16 GB.
+Untuk mencegah kebocoran label struktural:
+
+- semua sesi punya `requests` (profil default 1 CPU/1 GiB atau 2 CPU/2 GiB;
+  R4 jauh lebih besar), sehingga kolom request tidak pernah kosong;
+- semua sesi punya `quota_mem_mb`; R3 adalah sesi yang melampauinya;
+- durasi diundi dan tumpang-tindih antar skenario;
+- semua skenario bisa menulis log berkala (`COMMON_PARAMS`), dan
+  checkpoint/penyimpanan hasil benign bersifat opsional.
+
+Output: `<out-dir>/<session_id>.csv` per sesi, digabung otomatis jadi
+`<out-dir>/dataset.csv` di akhir proses.
 
 ### Metrik Prometheus saat executor Kubernetes
 
@@ -139,12 +169,17 @@ Konfigurasi lewat environment variable:
 | `PROM_SCRAPE_LAG_SEC` | `25` | jeda setelah job selesai sebelum query, agar scrape terakhir masuk |
 | `K8S_REQUEST_GPU` | `false` | `true` = container job meminta `nvidia.com/gpu: 1`, sidecar membaca `nvidia-smi` |
 | `JOB_IMAGE` | `local/data-generator-job:latest` | pakai `local/data-generator-job:gpu` (torch CUDA) saat mode GPU |
+| `CODE_SOURCE` | `configmap` | kode skenario/sidecar dikirim lewat ConfigMap `data-generator-code` dan di-mount ke `/app`; `image` = pakai kode yang dibake di image |
+
+Dengan `CODE_SOURCE=configmap` image cukup berisi dependency: mengubah
+`scenarios/*.py` atau `telemetry_sidecar.py` tidak perlu rebuild image,
+dan hash kode dicatat di `plan.json` (`code_sha256`).
 
 Image GPU dibangun dari Dockerfile yang sama:
 
 ```bash
 docker build -f docker/Dockerfile.job \
-  --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu126 \
+  --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128 \
   -t local/data-generator-job:gpu .
 ```
 
@@ -164,30 +199,13 @@ Perbedaan semantik kolom lokal vs Prometheus:
 | `mem_rss_mb` (RSS proses) | `prom_mem_rss_mb` (working set container) | nilai mirip |
 | `io_read_mb`, `io_write_mb` (**kumulatif** MB) | `prom_io_read_mb`, `prom_io_write_mb` (**laju** MB/s) | jangan dicampur |
 
-## Menangani skenario dengan metadata tambahan (mis. kuota)
+## Metadata tambahan per skenario
 
-Skenario seperti `misuse_quota_exceed.py` butuh kolom tambahan di CSV
-(`claimed_quota_mb`) yang tidak ada di skenario lain. Oper lewat
-`extra_meta` saat memanggil `run_labeled_job()` langsung (bukan lewat
-`run_experiment.py` generik, yang tidak tahu skenario mana butuh
-metadata apa):
-
-```python
-from registry import discover_scenarios, get
-from job_runner import run_labeled_job
-
-discover_scenarios()
-scenario = get("misuse_quota_exceed")
-run_labeled_job(
-    scenario, session_id="custom_001", out_dir="data",
-    extra_meta={"claimed_quota_mb": 1024},
-)
-```
-
-TODO (mahasiswa): jika BANYAK skenario butuh extra_meta yang berbeda-
-beda, pertimbangkan menambah field `extra_meta_template: dict` di
-`Scenario` (scenario_base.py) supaya `run_experiment.py` generik bisa
-otomatis mengopernya tanpa kode khusus per skenario.
+Metadata statis yang perlu ikut menjadi kolom CSV ditaruh di
+`Scenario.extra_meta`; nilai yang bervariasi per sesi ditaruh di
+`Scenario.params` (otomatis menjadi kolom `param_*`). Kuota sesi
+(`quota_mem_mb`) dibagikan run_experiment.py ke semua sesi; skenario
+yang membutuhkannya sebagai argumen memakai `session_quota()`.
 
 ## Menjalankan di Kubernetes/kind (bukan lokal)
 

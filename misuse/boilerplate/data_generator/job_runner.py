@@ -19,7 +19,7 @@ from telemetry_logger import TelemetryLogger
 
 def run_labeled_job(scenario: Scenario, session_id: str, out_dir="data",
                      interval_sec=5.0, args_override=None, extra_meta=None,
-                     gpu_index=0):
+                     gpu_index=0, **_k8s_only):
     """
     Parameters
     ----------
@@ -34,6 +34,9 @@ def run_labeled_job(scenario: Scenario, session_id: str, out_dir="data",
                           (mis. claimed_quota_mb untuk skenario yang
                           membutuhkannya -- lihat
                           scenarios/misuse_quota_exceed.py).
+
+    **_k8s_only : n_waiters, n_siblings, job_requests -- konteks cluster
+                          yang hanya bermakna di k8s_job_runner; diabaikan.
 
     Returns
     -------

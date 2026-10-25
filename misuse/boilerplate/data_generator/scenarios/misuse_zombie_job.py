@@ -1,16 +1,16 @@
 """
 scenarios/misuse_zombie_job.py
 =================================
-Job MISUSE: zombie job. Proses hidup lama tanpa aktivitas apapun,
-merepresentasikan job yang tidak dibersihkan otomatis. Harus dihentikan
-paksa lewat timeout_sec eksternal (bukan berhenti sendiri).
+Job MISUSE R5 (K2): zombie / abandoned workload. Proses hidup lama
+tanpa aktivitas apapun sejak awal, merepresentasikan job yang tidak
+dibersihkan otomatis. Harus dihentikan paksa lewat timeout eksternal.
 """
 import argparse
 import time
 
 import torch
 
-from scenario_base import Scenario
+from scenario_base import LogWriter, Scenario, add_common_args, mem_frac
 from registry import register
 
 
@@ -18,7 +18,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--duration-sec", type=int, default=1200)
     ap.add_argument("--hold-mem-mb", type=int, default=512)
+    add_common_args(ap)
     args = ap.parse_args()
+    log = LogWriter(args.log_every_sec, args.log_kb)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     n_floats = int(args.hold_mem_mb * 1024 * 1024 / 4)
@@ -29,6 +31,7 @@ def main():
     start = time.time()
     while time.time() - start < args.duration_sec:
         time.sleep(10)
+        log.tick()
 
     print("[misuse_zombie_job] selesai.")
 
@@ -43,6 +46,10 @@ register(Scenario(
                 "sejak awal (ditinggalkan), tidak pernah berhenti sendiri.",
     code="R5",
     label_class="K2",  # K2 karena melampaui kebijakan lifetime (Bagian 2, catatan R5)
+    params={
+        "duration_sec": (240, 600),
+        "hold_mem_mb": mem_frac(0.05, 0.2),
+    },
 ))
 
 

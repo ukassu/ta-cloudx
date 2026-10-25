@@ -23,7 +23,7 @@ kubectl run smoke-test --rm -it --restart=Never -n testbed-jobs \
 
 
 run experiment
-python run_experiment.py --executor k8s --repeats 10 --out-dir data
+python run_experiment.py --executor k8s --sessions 300 --out-dir data
 
 
 # ============================================================
@@ -73,16 +73,22 @@ source /home/ukass/cloudx-fp/misuse/venv/bin/activate
 # ------------------------------------------------------------
 # 4. Build image job + import ke worker k0s
 # ------------------------------------------------------------
-# WAJIB diulang setiap kali scenarios/*.py atau telemetry_sidecar.py diubah.
-# (k8s_job_runner.py & run_experiment.py jalan di host, tidak perlu rebuild.)
+# Image hanya berisi dependency (torch, pandas, psutil). Kode skenario & sidecar
+# dikirim ke Pod lewat ConfigMap "data-generator-code" setiap run dimulai, jadi
+# mengubah scenarios/*.py, telemetry_sidecar.py, dsb TIDAK perlu rebuild.
+# Rebuild hanya saat dependency/Dockerfile berubah, atau pertama kali di mesin baru.
 cd /home/ukass/cloudx-fp/misuse/boilerplate/data_generator
 
-# a) Image GPU (DIPAKAI untuk dataset utama) -- torch CUDA, ~11 GB, import ~3 menit.
+# a) Image GPU (DIPAKAI untuk dataset utama) -- torch CUDA 12.8, ~11 GB, import ~3 menit.
+#    cu128 WAJIB untuk RTX 50xx (PC lab, RTX 5060 Ti) dan tetap jalan di RTX 3050.
 #    Cukup ke node-2 karena hanya node-2 yang punya GPU.
+#    Disk C sempit? Hapus dulu image lama di node-2 sebelum import (ruangnya dipakai ulang):
+#      docker exec k0s-node-2 sh -c "k0s ctr images ls -q | grep data-generator-job:gpu | xargs -r k0s ctr images rm"
 docker build -f docker/Dockerfile.job \
-  --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu126 \
+  --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128 \
   -t local/data-generator-job:gpu .
 docker save local/data-generator-job:gpu | docker exec -i k0s-node-2 k0s ctr images import -
+docker image rm local/data-generator-job:gpu && docker builder prune -af   # salinan docker tak diperlukan lagi
 
 # b) Image CPU (opsional, untuk run tanpa GPU) -- ke kedua worker
 docker build -f docker/Dockerfile.job -t local/data-generator-job:latest .
@@ -111,21 +117,14 @@ export PROM_RATE_WINDOW=1m        # jendela rate() untuk CPU/IO/network
 export PROM_SCRAPE_LAG_SEC=25     # jeda sebelum query agar scrape terakhir masuk
 
 # ------------------------------------------------------------
-# 6. Uji cepat (sekitar 5 menit)
+# 6. Uji cepat (~25 menit): 1 sesi per skenario, durasi tetap 60 s
 # ------------------------------------------------------------
-python run_experiment.py --executor k8s --repeats 1 \
-  --scenarios benign_eda_notebook,misuse_idle_hoarding \
-  --duration-sec 90 --out-dir data-test
+python run_experiment.py --executor k8s --sessions 15 --misuse-frac 0.67 \
+  --duration-sec 60 --out-dir data-test
+python validate_dataset.py data-test   # peringatan "< 5 sesi" wajar untuk uji cepat
 
 # Cek: tiap sesi harus punya .csv, .prometheus.csv, .merged.csv
 ls data-test
-python - <<'EOF'
-import pandas as pd
-df = pd.read_csv("data-test/dataset.csv")
-cols = ["cpu_pct", "mem_rss_mb", "prom_cpu_pct", "prom_mem_rss_mb"]
-print(df.groupby("job_type")[cols].agg(["mean", "max"]).T.round(1))
-print(df.filter(like="prom_").isna().mean().round(2))
-EOF
 # Yang diharapkan (mode GPU): misuse_idle_hoarding gpu_mem_used_mb_device ~2200 MB
 # dengan gpu_util_pct rendah. Mode CPU: mem_rss_mb ~2200 MB, CPU ~0 setelah alokasi.
 #
@@ -147,31 +146,40 @@ kubectl delete pod -n testbed-jobs --all      # bersihkan Pod sisa run yang terh
 # ------------------------------------------------------------
 # 15 skenario (5 benign + 10 misuse, kode taksonomi CATS R1-R7, P5, S1):
 #   python -c 'from registry import discover_scenarios as d; [print(s.name, s.code, s.label_class) for s in d()]'
-# --duration-sec menyamakan durasi semua skenario (timeout ikut menyesuaikan);
-# P5 (misuse_gpu_monopolization) otomatis 3x lebih lama.
-#   --duration-sec 300 -> ~1 jam 40 menit per putaran (~16 jam untuk 10 putaran)
-#   --duration-sec 180 -> ~1 jam per putaran        (~10 jam untuk 10 putaran)
-# Overhead tiap sesi ~45 detik (start Pod + jeda scrape Prometheus).
-# Bisa dicicil per kelompok skenario dengan --scenarios a,b,c ke out-dir berbeda.
+# Rencana v2: --sessions sesi dibagi benign/misuse (--misuse-frac), parameter tiap
+# sesi diundi dari `params` skenario (seed tetap -> rencana bisa diulang persis).
+# Perkiraan waktu (rata-rata durasi ~7 menit/sesi termasuk overhead ~45 s):
+#   --sessions 300                       -> ~41 jam (misuse 45 sesi, 4-5 per skenario)
+#   --sessions 300 --duration-scale 0.5  -> ~22 jam
+#   --sessions 400 --misuse-frac 0.25 --duration-scale 0.5 -> ~29 jam (misuse 100, ~10 per skenario)
 # Pastikan env mode GPU dari langkah 5 sudah di-export di terminal ini.
-# Pakai out-dir BARU tiap run: session_id mulai lagi dari 0001 dan
-# dataset.csv menggabungkan SEMUA *.merged.csv di folder itu.
 # Jalankan di background supaya tidak putus saat terminal ditutup:
-nohup python run_experiment.py --executor k8s --repeats 10 \
-  --duration-sec 300 --out-dir data-k0s-$(date +%Y%m%d) > run.log 2>&1 &
+OUT=data-v2-$(date +%Y%m%d)
+nohup python run_experiment.py --executor k8s --sessions 300 --duration-scale 0.5 \
+  --out-dir $OUT > run.log 2>&1 &
 tail -f run.log
 kubectl get pods -n testbed-jobs -w             # pantau Pod yang sedang jalan
+
+# Terputus (Ctrl-C, terminal ditutup, WSL restart)? Lanjutkan rencana yang SAMA:
+#   (setelah WSL restart: nyalakan cluster dulu, langkah 1, dan export env langkah 5)
+nohup python run_experiment.py --executor k8s --resume --out-dir $OUT >> run.log 2>&1 &
+#   Sesi yang sudah punya .merged.csv dilewati; Pod sisa sesi terputus dihapus otomatis.
+
+# Setelah selesai: laporan validitas dataset (bahan evaluasi TA 1)
+python validate_dataset.py $OUT      # -> $OUT/validation_report.txt
 
 # Output per sesi:
 #   <session>.csv             telemetri psutil dari sidecar
 #   <session>.prometheus.csv  query_range Prometheus (step = --interval-sec)
 #   <session>.merged.csv      gabungan berdasarkan timestamp (dipakai dataset.csv)
-#   policy.json               ambang kebijakan sandbox (idle, batas sesi, kuota)
+#   plan.json                 rencana sesi + parameter yang diundi (untuk --resume)
+#   policy.json               ambang kebijakan sandbox (idle, batas sesi, memori GPU node)
 #
 # Kolom label & konteks (lihat README data_generator, "Skenario dan taksonomi CATS"):
 #   label (benign/misuse), scenario_code (BENIGN/R1../P5/S1), label_class (-/K1/K2/K3),
-#   user_id, session_age_sec, last_activity_age_sec, gpu_alloc_sec,
-#   prom_queue_length, prom_queue_wait_max_sec, prom_user_active_sessions
+#   user_id, session_age_sec, last_activity_age_sec, gpu_alloc_sec, quota_mem_mb,
+#   prom_queue_length, prom_queue_wait_max_sec, prom_user_active_sessions,
+#   param_* (parameter yang diundi = ground truth, JANGAN dipakai sebagai fitur model)
 # Antrean (queue) hanya terisi di mode GPU: runner membuat Pod "waiter-*" yang
 # Pending karena GPU dipegang sesi. Sesi paralel R6 = Pod "session-*-sib-N".
 # Jika run dihentikan paksa, bersihkan sisa Pod: kubectl delete pod -n testbed-jobs --all
@@ -179,7 +187,7 @@ kubectl get pods -n testbed-jobs -w             # pantau Pod yang sedang jalan
 # Cek cepat sinyal per skenario setelah run:
 python - <<'EOF'
 import glob, pandas as pd
-d = sorted(glob.glob("data-k0s-*"))[-1]
+d = sorted(glob.glob("data-v2-*"))[-1]
 df = pd.read_csv(f"{d}/dataset.csv")
 cols = ["gpu_util_pct", "gpu_mem_used_mb_device", "cpu_pct", "last_activity_age_sec",
         "prom_queue_length", "prom_queue_wait_max_sec", "prom_user_active_sessions"]

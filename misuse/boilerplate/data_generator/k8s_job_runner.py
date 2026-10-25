@@ -20,6 +20,8 @@ Prasyarat: pip install kubernetes
 """
 
 import csv
+import glob
+import hashlib
 import json
 import os
 import random
@@ -87,7 +89,56 @@ PROMETHEUS_QUERIES = {
 }
 PROMETHEUS_COLUMNS = [f"prom_{name}" for name in PROMETHEUS_QUERIES]
 
+# Kode skenario dikirim lewat ConfigMap dan di-mount ke /app, sehingga image
+# cukup berisi dependency: mengubah scenarios/*.py tidak perlu rebuild image.
+# CODE_SOURCE=image memakai kode yang dibake ke image (perilaku lama).
+CODE_SOURCE = os.environ.get("CODE_SOURCE", "configmap")
+CODE_CONFIGMAP = "data-generator-code"
+_MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 _config_loaded = False
+_code_volume = None
+
+
+def code_files():
+    """File yang dibutuhkan di dalam Pod, relatif terhadap folder modul ini."""
+    files = ["scenario_base.py", "registry.py", "telemetry_sidecar.py"]
+    files += sorted(os.path.relpath(f, _MODULE_DIR)
+                    for f in glob.glob(os.path.join(_MODULE_DIR, "scenarios", "*.py")))
+    return files
+
+
+def code_sha256():
+    digest = hashlib.sha256()
+    for rel in code_files():
+        digest.update(rel.encode())
+        with open(os.path.join(_MODULE_DIR, rel), "rb") as f:
+            digest.update(f.read())
+    return digest.hexdigest()
+
+
+def _sync_code_configmap(v1):
+    """Buat/perbarui ConfigMap kode; return definisi volume untuk Pod."""
+    data, items = {}, []
+    for rel in code_files():
+        key = rel.replace("/", "__")   # key ConfigMap tidak boleh mengandung "/"
+        with open(os.path.join(_MODULE_DIR, rel)) as f:
+            data[key] = f.read()
+        items.append({"key": key, "path": rel})
+    body = {"metadata": {"name": CODE_CONFIGMAP, "namespace": NAMESPACE,
+                         "labels": {"code-sha256": code_sha256()[:16]}},
+            "data": data}
+    try:
+        v1.replace_namespaced_config_map(CODE_CONFIGMAP, NAMESPACE, body)
+    except client.ApiException as exc:
+        if exc.status != 404:
+            raise
+        v1.create_namespaced_config_map(NAMESPACE, body)
+    return {"name": "code", "configMap": {"name": CODE_CONFIGMAP, "items": items}}
+
+
+def _code_mounts():
+    return [{"name": "code", "mountPath": "/app"}] if _code_volume else []
 
 
 def _ensure_kube_config():
@@ -207,10 +258,10 @@ def _pod_name_from_session(session_id: str) -> str:
 
 def build_pod_manifest(scenario: Scenario, session_id: str, args: list,
                         interval_sec: float, extra_meta: dict,
-                        request_gpu: bool = False):
+                        request_gpu: bool = False, job_requests=None):
     job_cmd_match = os.path.basename(scenario.script_path)
 
-    job_resources = {kind: dict(values) for kind, values in scenario.job_resources.items()}
+    job_resources = {"requests": dict(job_requests)} if job_requests else {}
     if request_gpu:
         # Hanya aktif jika device plugin GPU sudah terpasang -- lihat
         # docstring modul ini. Default False untuk cluster tanpa GPU.
@@ -222,7 +273,7 @@ def build_pod_manifest(scenario: Scenario, session_id: str, args: list,
         "imagePullPolicy": IMAGE_PULL_POLICY,
         "command": ["python", scenario.script_path] + args,
         "env": [{"name": "ACTIVITY_FILE", "value": ACTIVITY_FILE}],
-        "volumeMounts": [{"name": "shared-data", "mountPath": "/data"}],
+        "volumeMounts": [{"name": "shared-data", "mountPath": "/data"}] + _code_mounts(),
         "resources": job_resources,
     }
 
@@ -241,7 +292,7 @@ def build_pod_manifest(scenario: Scenario, session_id: str, args: list,
             {"name": "ACTIVITY_FILE", "value": ACTIVITY_FILE},
             {"name": "EXTRA_META_JSON", "value": json.dumps(extra_meta or {})},
         ],
-        "volumeMounts": [{"name": "shared-data", "mountPath": "/data"}],
+        "volumeMounts": [{"name": "shared-data", "mountPath": "/data"}] + _code_mounts(),
     }
     if request_gpu:
         # Sidecar tidak meminta nvidia.com/gpu (GPU hanya 1, dipegang job),
@@ -264,7 +315,8 @@ def build_pod_manifest(scenario: Scenario, session_id: str, args: list,
             "shareProcessNamespace": True,
             "restartPolicy": "Never",
             "containers": [job_container, telemetry_container],
-            "volumes": [{"name": "shared-data", "emptyDir": {}}],
+            "volumes": [{"name": "shared-data", "emptyDir": {}}]
+                       + ([_code_volume] if _code_volume else []),
         },
     }
 
@@ -290,7 +342,9 @@ def _helper_pod_manifest(name, session_id, role, command, resources=None,
                 "imagePullPolicy": IMAGE_PULL_POLICY,
                 "command": command,
                 "resources": resources or {},
+                "volumeMounts": _code_mounts(),
             }],
+            "volumes": [_code_volume] if _code_volume else [],
         },
     }
     if node_name:
@@ -313,33 +367,61 @@ def _delete_pods(v1, names):
             pass
 
 
+def _delete_session_leftovers(v1, session_id, timeout_sec=60):
+    """Hapus Pod sisa sesi yang sama (run terputus lalu --resume)."""
+    selector = f"session_id={session_id}"
+    leftovers = v1.list_namespaced_pod(NAMESPACE, label_selector=selector).items
+    if not leftovers:
+        return
+    _delete_pods(v1, [p.metadata.name for p in leftovers])
+    deadline = time.time() + timeout_sec
+    while v1.list_namespaced_pod(NAMESPACE, label_selector=selector).items:
+        if time.time() > deadline:
+            raise RuntimeError(f"Pod sisa sesi {session_id} tidak terhapus")
+        time.sleep(2)
+
+
 def run_labeled_job(scenario: Scenario, session_id: str, out_dir="data",
                      interval_sec=5.0, args_override=None, extra_meta=None,
-                     request_gpu=None):
+                     request_gpu=None, n_waiters=None, n_siblings=None,
+                     job_requests=None):
     """
-    Signature SAMA PERSIS dengan job_runner.run_labeled_job() (versi
+    Signature kompatibel dengan job_runner.run_labeled_job() (versi
     subprocess lokal) -- run_experiment.py bisa memakai salah satu
     tanpa mengubah cara pemanggilan, hanya beda modul yang di-import.
+
+    n_waiters / n_siblings / job_requests berasal dari plan.json; None =
+    diundi dari rentang Scenario (pemanggilan langsung tanpa rencana).
     """
+    global _code_volume
     _ensure_kube_config()
     v1 = client.CoreV1Api()
+    if CODE_SOURCE == "configmap" and _code_volume is None:
+        _code_volume = _sync_code_configmap(v1)
     if request_gpu is None:
         request_gpu = REQUEST_GPU
 
     args = args_override if args_override is not None else scenario.default_args
     timeout_sec = scenario.timeout_sec or 600
 
+    if n_waiters is None:
+        n_waiters = random.randint(*scenario.queue_waiters)
+    if n_siblings is None:
+        n_siblings = random.randint(*scenario.sibling_sessions)
+
     pod_manifest = build_pod_manifest(
         scenario, session_id, args, interval_sec, extra_meta, request_gpu,
+        job_requests,
     )
     pod_name = pod_manifest["metadata"]["name"]
+    _delete_session_leftovers(v1, session_id)
 
     # Waiter hanya bermakna di mode GPU: mereka Pending karena GPU satu-
     # satunya dipegang sesi ini. Tanpa GPU, waiter justru akan mendapat GPU.
-    n_waiters = random.randint(*scenario.queue_waiters) if request_gpu else 0
-    if scenario.queue_waiters[1] > 0 and not request_gpu:
+    if n_waiters and not request_gpu:
         print(f"[k8s_job_runner] NOTE: antrean {scenario.name} dilewati "
               f"(butuh K8S_REQUEST_GPU=true)")
+        n_waiters = 0
     expected_sec = _expected_duration(scenario, args)
     if scenario.queue_arrival == "spread":
         waiter_offsets = [expected_sec * (i + 1) / (n_waiters + 1) for i in range(n_waiters)]
@@ -349,7 +431,7 @@ def run_labeled_job(scenario: Scenario, session_id: str, out_dir="data",
 
     v1.create_namespaced_pod(namespace=NAMESPACE, body=pod_manifest)
     print(f"[k8s_job_runner] Pod {pod_name} dibuat (scenario={scenario.name}, "
-          f"waiters={n_waiters}, siblings={scenario.sibling_sessions}), "
+          f"waiters={n_waiters}, siblings={n_siblings}), "
           f"menunggu job selesai (timeout={timeout_sec}s)...")
 
     start = time.time()
@@ -371,7 +453,7 @@ def run_labeled_job(scenario: Scenario, session_id: str, out_dir="data",
             if running_since is None and state and state.running is not None:
                 # Pod pendukung dibuat setelah sesi memegang GPU-nya
                 running_since = time.time()
-                for i in range(scenario.sibling_sessions):
+                for i in range(n_siblings):
                     name = f"{pod_name}-sib-{i + 1}"
                     v1.create_namespaced_pod(namespace=NAMESPACE, body=_helper_pod_manifest(
                         name, session_id, "sibling",

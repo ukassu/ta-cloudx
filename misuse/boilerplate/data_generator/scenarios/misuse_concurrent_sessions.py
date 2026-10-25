@@ -15,14 +15,17 @@ import time
 
 import torch
 
-from scenario_base import Scenario, touch_activity
+from scenario_base import LogWriter, Scenario, add_common_args, touch_activity
 from registry import register
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--duration-sec", type=int, default=600)
+    ap.add_argument("--max-think-sec", type=float, default=40)
+    add_common_args(ap)
     args = ap.parse_args()
+    log = LogWriter(args.log_every_sec, args.log_kb)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = torch.nn.Sequential(
@@ -35,7 +38,8 @@ def main():
         burst_end = time.time() + random.uniform(3, 12)
         while time.time() < burst_end:
             model(torch.randn(512, 1024, device=device)).sum().backward()
-        time.sleep(random.uniform(5, 40))
+        log.tick()
+        time.sleep(random.uniform(5, args.max_think_sec))
 
     print("[misuse_concurrent_sessions] selesai.")
 
@@ -46,11 +50,16 @@ register(Scenario(
     script_path="scenarios/misuse_concurrent_sessions.py",
     default_args=["--duration-sec", "600"],
     timeout_sec=620,
-    description="Sesi utama wajar, tetapi 3 sesi notebook lain milik pengguna "
-                "yang sama berjalan bersamaan (4 sesi > batas 2).",
+    description="Sesi utama wajar, tetapi 2-4 sesi notebook lain milik pengguna "
+                "yang sama berjalan bersamaan (3-5 sesi > batas 2).",
     code="R6",
     label_class="K2",
-    sibling_sessions=3,
+    params={
+        "duration_sec": (180, 600),
+        "max_think_sec": (10, 60),
+    },
+    queue_waiters=(0, 1),
+    sibling_sessions=(2, 4),
 ))
 
 

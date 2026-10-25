@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from scenario_base import Scenario, touch_activity
+from scenario_base import LogWriter, Scenario, add_common_args, touch_activity
 from registry import register
 
 
@@ -34,13 +34,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--duration-sec", type=int, default=600)
     ap.add_argument("--batch-size", type=int, default=256)
+    ap.add_argument("--image-size", type=int, default=32)
+    add_common_args(ap)
     args = ap.parse_args()
+    log = LogWriter(args.log_every_sec, args.log_kb)
 
     torch.set_num_threads(1)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    size = args.image_size
     model = nn.Sequential(
         nn.Conv2d(3, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-        nn.Flatten(), nn.Linear(32 * 16 * 16, 10),
+        nn.Flatten(), nn.Linear(32 * (size // 2) ** 2, 10),
     ).to(device)
     opt = optim.Adam(model.parameters(), lr=1e-3)
     loss_fn = nn.CrossEntropyLoss()
@@ -48,7 +52,7 @@ def main():
     start = time.time()
     step = 0
     while time.time() - start < args.duration_sec:
-        x = torch.from_numpy(slow_preprocess(args.batch_size)).to(device)
+        x = torch.from_numpy(slow_preprocess(args.batch_size, size)).to(device)
         y = torch.randint(0, 10, (args.batch_size,), device=device)
         opt.zero_grad()
         loss_fn(model(x), y).backward()
@@ -56,6 +60,7 @@ def main():
         step += 1
         if step % 10 == 0:
             touch_activity()
+            log.tick()
 
     print(f"[misuse_inefficient_gpu] selesai, {step} step.")
 
@@ -70,6 +75,11 @@ register(Scenario(
                 "CPU ~100% (1 core), progres training tetap ada.",
     code="R7",
     label_class="K1",
+    params={
+        "duration_sec": (180, 600),
+        "batch_size": [128, 256, 512],
+        "image_size": [32, 48, 64],   # makin besar makin lambat di CPU -> GPU makin rendah
+    },
     queue_waiters=(0, 2),
 ))
 

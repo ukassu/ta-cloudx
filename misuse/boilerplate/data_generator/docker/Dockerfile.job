@@ -10,9 +10,11 @@
 #   docker build -f docker/Dockerfile.job -t local/data-generator-job:latest .
 #   kind load docker-image local/data-generator-job:latest --name <nama-cluster>
 #
-# Varian GPU (torch CUDA; driver & nvidia-smi disuntik runtime NVIDIA node):
+# Varian GPU (torch CUDA; driver & nvidia-smi disuntik runtime NVIDIA node).
+# cu128 = CUDA 12.8, wajib untuk RTX 50xx (Blackwell, sm_120) dan tetap
+# mendukung GPU lama (mis. RTX 30xx):
 #   docker build -f docker/Dockerfile.job \
-#     --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu126 \
+#     --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128 \
 #     -t local/data-generator-job:gpu .
 # ============================================================================
 FROM python:3.11-slim
