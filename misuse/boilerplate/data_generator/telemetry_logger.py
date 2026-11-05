@@ -105,7 +105,7 @@ class TelemetryLogger:
         "timestamp", "session_id", "label", "job_type",
         "cpu_pct", "mem_rss_mb", "io_read_mb", "io_write_mb",
         "num_alive_processes", "gpu_util_pct", "gpu_mem_util_pct",
-        "gpu_mem_used_mb_device", "gpu_mem_used_mb_process",
+        "gpu_mem_used_mb_device", "gpu_mem_used_mb_process", "gpu_mem_total_mb",
     ]
 
     def __init__(self, root_pid, session_id, label, job_type, out_path,
@@ -134,16 +134,19 @@ class TelemetryLogger:
                 pass
 
     def _loop(self):
+        next_sample = time.time()
         while not self._stop_flag.is_set():
             pids = _collect_pid_tree(self.root_pid)
             if not pids:
                 break
+            # waktu sampel dicatat sebelum query nvidia-smi yang lamanya bervariasi
+            sampled_at = datetime.now(timezone.utc)
             proc_stats = get_process_cpu_mem_io(pids)
             gpu_dev = get_gpu_device_stats(self.gpu_index)
             gpu_proc_mem = get_process_gpu_memory_mb(pids)
 
             row = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": sampled_at.isoformat(),
                 "session_id": self.session_id, "label": self.label,
                 "job_type": self.job_type,
                 "cpu_pct": round(proc_stats["cpu_pct"], 3),
@@ -155,6 +158,7 @@ class TelemetryLogger:
                 "gpu_mem_util_pct": gpu_dev["gpu_mem_util_pct"],
                 "gpu_mem_used_mb_device": gpu_dev["gpu_mem_used_mb"],
                 "gpu_mem_used_mb_process": round(gpu_proc_mem, 3),
+                "gpu_mem_total_mb": gpu_dev["gpu_mem_total_mb"],
             }
             row.update(self.extra_meta)
             self._writer.writerow(row)
@@ -162,7 +166,9 @@ class TelemetryLogger:
 
             if proc_stats["num_alive_processes"] == 0:
                 break
-            self._stop_flag.wait(self.interval_sec)
+            # jadwal tetap, sama dengan telemetry_sidecar.py
+            next_sample = max(next_sample + self.interval_sec, time.time())
+            self._stop_flag.wait(max(0.0, next_sample - time.time()))
 
     def start(self):
         self._thread = threading.Thread(target=self._loop, daemon=True)

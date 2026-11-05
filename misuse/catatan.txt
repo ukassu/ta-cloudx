@@ -117,16 +117,22 @@ export PROM_RATE_WINDOW=1m        # jendela rate() untuk CPU/IO/network
 export PROM_SCRAPE_LAG_SEC=25     # jeda sebelum query agar scrape terakhir masuk
 
 # ------------------------------------------------------------
-# 6. Uji cepat (~25 menit): 1 sesi per skenario, durasi tetap 60 s
+# 6. Uji cepat (~35 menit): 1 sesi per skenario, durasi 60 s
+#    (P5 180 s; R2 ~3-4 menit dan R5 150 s agar melewati ambang idle)
 # ------------------------------------------------------------
 python run_experiment.py --executor k8s --sessions 15 --misuse-frac 0.67 \
   --duration-sec 60 --out-dir data-test
 python validate_dataset.py data-test   # peringatan "< 5 sesi" wajar untuk uji cepat
 
-# Cek: tiap sesi harus punya .csv, .prometheus.csv, .merged.csv
+# Cek: tiap sesi harus punya .csv, .prometheus.csv, .merged.csv; sesi yang gagal
+# punya .failed.json (alasan + ekor log job) dan diulang dengan --resume
 ls data-test
-# Yang diharapkan (mode GPU): misuse_idle_hoarding gpu_mem_used_mb_device ~2200 MB
-# dengan gpu_util_pct rendah. Mode CPU: mem_rss_mb ~2200 MB, CPU ~0 setelah alokasi.
+# Yang diharapkan: bagian 6 validate_dataset.py ("Cek ground truth per sesi")
+# berstatus lolos untuk semua skenario, kecuali misuse_disguised_pattern yang wajar
+# "tidak lengkap" di uji cepat (60 s lebih pendek dari dua periode osilasinya).
+# Detail per sesi di data-test/ground_truth_check.csv. Contoh nilai mode GPU:
+# misuse_idle_hoarding gpu_mem_used_mb_device = 50-85% quota_mem_mb dengan
+# gpu_util_pct ~0; misuse_quota_exceed di atas quota_mem_mb.
 #
 # Catatan GPU di WSL2 (laptop):
 #   - gpu_mem_used_mb_process selalu 0: nvidia-smi di WSL2 tidak melaporkan proses.
@@ -164,15 +170,19 @@ kubectl get pods -n testbed-jobs -w             # pantau Pod yang sedang jalan
 #   (setelah WSL restart: nyalakan cluster dulu, langkah 1, dan export env langkah 5)
 nohup python run_experiment.py --executor k8s --resume --out-dir $OUT >> run.log 2>&1 &
 #   Sesi yang sudah punya .merged.csv dilewati; Pod sisa sesi terputus dihapus otomatis.
+#   Sesi gagal (.failed.json) ikut diulang. Lanjutkan di mesin yang SAMA: rencana
+#   terikat ke VRAM mesin pembuatnya (--resume ditolak di mesin dengan VRAM lain).
 
 # Setelah selesai: laporan validitas dataset (bahan evaluasi TA 1)
-python validate_dataset.py $OUT      # -> $OUT/validation_report.txt
+python validate_dataset.py $OUT      # -> validation_report.txt, ground_truth_check.csv,
+                                     #    dataset_verified.csv (hanya sesi lolos; pakai ini)
 
 # Output per sesi:
 #   <session>.csv             telemetri psutil dari sidecar
 #   <session>.prometheus.csv  query_range Prometheus (step = --interval-sec)
 #   <session>.merged.csv      gabungan berdasarkan timestamp (dipakai dataset.csv)
-#   plan.json                 rencana sesi + parameter yang diundi (untuk --resume)
+#   <session>.failed.json     hanya untuk sesi gagal: alasan + ekor log job
+#   plan.json                 rencana sesi + parameter yang diundi + info GPU (untuk --resume)
 #   policy.json               ambang kebijakan sandbox (idle, batas sesi, memori GPU node)
 #
 # Kolom label & konteks (lihat README data_generator, "Skenario dan taksonomi CATS"):

@@ -26,13 +26,13 @@ untuk detector.
 
 | Skenario | Kode | Kelas | Pola simulasi | Konteks dari runner |
 |----------|------|-------|---------------|---------------------|
-| benign_cnn_training | BENIGN | - | GPU siklik per epoch, checkpoint opsional | antrean 0-2 |
+| benign_cnn_training | BENIGN | - | GPU tinggi per epoch, checkpoint opsional | antrean 0-2 |
 | benign_eda_notebook | BENIGN | - | CPU pandas, GPU ~0 | 0-1 sesi paralel (di bawah batas) |
 | benign_interactive_gpu_notebook | BENIGN | - | burst per cell + jeda berpikir | antrean 0-1, 0-1 sesi paralel |
 | benign_data_pipeline_training | BENIGN | - | baca shard dari disk, dip GPU saat data loading | antrean 0-2 |
 | benign_batch_inference | BENIGN | - | burst GPU per batch, tulis prediksi opsional | antrean 0-1 |
-| misuse_idle_hoarding | R1 | K2 | VRAM 30-60% ditahan, util ~0, keep-alive | antrean 1-3 |
-| misuse_idle_session | R2 | K2 | aktif 10-35% awal sesi lalu kernel idle | antrean 0-1 |
+| misuse_idle_hoarding | R1 | K2 | VRAM 50-85% kuota sesi ditahan, util ~0, keep-alive | antrean 1-3 |
+| misuse_idle_session | R2 | K2 | aktif 10-35% awal sesi lalu kernel idle melewati ambang idle | antrean 0-1 |
 | misuse_quota_exceed | R3 | K2 | VRAM 1.3-1.8x `quota_mem_mb` sesi | antrean 0-1 |
 | misuse_overprovisioning | R4 | K1 | request 4-8 CPU / 3-4 GiB, pakai < 0.5 core | - |
 | misuse_zombie_job | R5 | K2 | flat, tanpa aktivitas sejak awal | - |
@@ -42,7 +42,9 @@ untuk detector.
 | misuse_synthetic_load | S1 | K3 | GPU 70-100% flat, tanpa aktivitas | - |
 | misuse_disguised_pattern | S1 | K3 | osilasi GPU teratur, tanpa aktivitas | - |
 
-Rentang parameter lengkap ada di `params` tiap file skenario.
+Rentang parameter lengkap ada di `params` tiap file skenario. Sumber
+definisi, rujukan, asumsi, dan celah tiap skenario terhadap Kajian ada di
+[`scenarios/README.md`](scenarios/README.md).
 
 Prioritas dokumen (R1, R2, R3, R6, P5, S1) tercakup; R4, R5, R7 (K1/K2)
 disertakan sebagai pembanding sulit. Skenario benign sengaja diberi
@@ -57,7 +59,8 @@ antrean/sesi paralel kadang-kadang agar konteks bukan penanda label.
 | `session_age_sec` | sidecar | umur proses job |
 | `last_activity_age_sec` | sidecar | detik sejak `touch_activity()` terakhir (eksekusi cell) |
 | `gpu_alloc_sec` | sidecar | detik-GPU teralokasi (0 di mode CPU) |
-| `prom_queue_length` | Prometheus | Pod waiter GPU yang Pending (mode GPU) |
+| `gpu_mem_total_mb` | sidecar | total VRAM node; konteks untuk normalisasi lintas mesin, bukan fitur |
+| `prom_queue_length` | Prometheus | Pod waiter GPU milik sesi ini yang Pending (mode GPU) |
 | `prom_queue_wait_max_sec` | Prometheus | waktu tunggu waiter terlama |
 | `prom_user_active_sessions` | Prometheus | sesi utama + sibling yang Running |
 | `quota_mem_mb` | run_experiment | kuota memori GPU sesi (50%/75% memori GPU node), semua sesi |
@@ -103,11 +106,13 @@ python run_experiment.py --executor k8s --sessions 300 --out-dir data-v2
 # Terputus? Lanjutkan rencana yang sama; sesi selesai dilewati
 python run_experiment.py --executor k8s --resume --out-dir data-v2
 
-# Uji cepat: 1 sesi per skenario, durasi tetap 60 s
+# Uji cepat: 1 sesi per skenario, durasi 60 s (P5 3x; R2/R5 lebih lama
+# agar melewati ambang idle)
 python run_experiment.py --executor k8s --sessions 15 --misuse-frac 0.67 \
     --duration-sec 60 --out-dir data-test
 
-# Laporan validitas dataset (variasi, kebocoran label, konsistensi kebijakan)
+# Laporan validitas dataset (variasi, kebocoran label, konsistensi
+# kebijakan, cek ground truth per sesi)
 python validate_dataset.py data-v2
 
 # Uji 1 skenario secara standalone (tanpa runner/telemetry)
@@ -118,6 +123,10 @@ Opsi rencana: `--sessions`, `--misuse-frac`, `--seed` (rencana identik
 untuk seed sama), `--duration-scale` (pengali durasi yang diundi),
 `--scenarios a,b` (subset). Rencana disimpan di `<out-dir>/plan.json`;
 out-dir yang sudah berisi rencana hanya bisa dilanjutkan dengan `--resume`.
+`plan.json` juga mencatat nama GPU, total VRAM, dan pemakaian GPU saat run
+dimulai (`gpu`; peringatan bila GPU sudah terpakai, mis. oleh layar).
+Parameter MB di rencana diundi dari VRAM mesin pembuatnya, jadi `--resume`
+ditolak di mesin dengan memori GPU berbeda -- buat rencana baru per mesin.
 
 ### Variasi per sesi (v2)
 
@@ -132,10 +141,23 @@ Untuk mencegah kebocoran label struktural:
 - semua sesi punya `quota_mem_mb`; R3 adalah sesi yang melampauinya;
 - durasi diundi dan tumpang-tindih antar skenario;
 - semua skenario bisa menulis log berkala (`COMMON_PARAMS`), dan
-  checkpoint/penyimpanan hasil benign bersifat opsional.
+  checkpoint/penyimpanan hasil benign bersifat opsional;
+- skenario yang labelnya mensyaratkan ambang kebijakan terlewati (R2, R5)
+  punya durasi minimum (`Scenario.min_duration_sec`), sehingga ambang idle
+  tetap terlewati walau `--duration-scale`/`--duration-sec` memperpendek
+  durasi.
 
 Output: `<out-dir>/<session_id>.csv` per sesi, digabung otomatis jadi
-`<out-dir>/dataset.csv` di akhir proses.
+`<out-dir>/dataset.csv` di akhir proses. Sesi yang gagal (exit code ≠ 0,
+timeout, atau telemetri tidak terambil) tidak masuk dataset karena
+perilakunya belum tentu sesuai label; alasan dan ekor log job dicatat di
+`<out-dir>/<session_id>.failed.json`, dan `--resume` mengulangnya.
+
+`validate_dataset.py` menguji tiap sesi terhadap definisi skenarionya (cek
+ground truth; daftar cek ada di [`scenarios/README.md`](scenarios/README.md))
+dan menulis `ground_truth_check.csv` serta `dataset_verified.csv`, yang
+hanya berisi sesi yang lolos. Pakai `dataset_verified.csv` untuk melatih
+dan mengevaluasi model.
 
 ### Metrik Prometheus saat executor Kubernetes
 

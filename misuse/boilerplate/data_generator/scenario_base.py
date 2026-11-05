@@ -24,7 +24,7 @@ CLI (`duration_sec` -> `--duration-sec`) dan dicatat sebagai kolom
 import os
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 # Kode taksonomi yang dipakai CATS (Kajian Misuse Detection CloudX v5,
 # Bagian 2-4). "BENIGN" untuk job wajar.
@@ -32,6 +32,11 @@ BENIGN_CODE = "BENIGN"
 LABEL_CLASSES = ("K1", "K2", "K3")
 
 ACTIVITY_FILE = os.environ.get("ACTIVITY_FILE", "/data/last_activity")
+
+# Selisih minimum di atas ambang idle (policy.json) untuk skenario yang
+# labelnya mensyaratkan ambang itu terlewati (R2, R5); sampel telemetri
+# terakhir bisa jatuh hingga 1 interval sebelum job selesai.
+IDLE_MARGIN_SEC = 30
 
 # Parameter yang berlaku untuk semua skenario (bisa ditimpa per skenario):
 # log berkala agar "tidak menulis ke disk" bukan penanda label.
@@ -63,6 +68,12 @@ def mem_frac(lo, hi):
 def session_quota():
     """Kuota memori sesi ini (kolom quota_mem_mb, diundi per sesi)."""
     return lambda rng, ctx: ctx["quota_mem_mb"]
+
+
+def quota_frac(lo, hi):
+    """Parameter MB sebesar porsi [lo, hi] dari kuota memori sesi ini
+    (quota_mem_mb); hi < 1 menjamin alokasi tetap di bawah kuota."""
+    return lambda rng, ctx: int(rng.uniform(lo, hi) * ctx["quota_mem_mb"])
 
 
 def add_common_args(ap):
@@ -139,6 +150,12 @@ class Scenario:
     duration_scale: float = 1.0
     """Pengali durasi tetap saat run_experiment.py --duration-sec dipakai
     (mode uji), mis. 3.0 untuk P5 monopolisasi."""
+
+    min_duration_sec: Optional[Callable[[dict, dict], float]] = None
+    """Durasi minimum sebagai fungsi (params, policy) -> detik, diterapkan
+    run_experiment.py setelah --duration-scale/--duration-sec. Untuk
+    skenario yang labelnya bergantung pada ambang kebijakan, mis. R2 harus
+    idle lebih lama dari idle_timeout_sec berapa pun skala durasinya."""
 
     queue_waiters: Tuple[int, int] = (0, 0)
     """Rentang (min, max) jumlah job GPU pengguna lain yang ikut antre

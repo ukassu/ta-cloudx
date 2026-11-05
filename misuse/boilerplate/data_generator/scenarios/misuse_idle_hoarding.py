@@ -10,7 +10,7 @@ import time
 
 import torch
 
-from scenario_base import LogWriter, Scenario, add_common_args, mem_frac, touch_activity
+from scenario_base import LogWriter, Scenario, add_common_args, quota_frac, touch_activity
 from registry import register
 
 
@@ -57,7 +57,9 @@ register(Scenario(
     label_class="K2",
     params={
         "duration_sec": (240, 600),
-        "hold_mem_mb": mem_frac(0.3, 0.6),   # di bawah kuota: hoarding, bukan R3
+        # porsi kuota sesi itu sendiri (+ konteks CUDA ~80 MB tetap di bawah
+        # kuota): hoarding, bukan R3
+        "hold_mem_mb": quota_frac(0.5, 0.85),
         "keepalive_sec": (30, 110),          # di bawah ambang idle 120 s
     },
     queue_waiters=(1, 3),

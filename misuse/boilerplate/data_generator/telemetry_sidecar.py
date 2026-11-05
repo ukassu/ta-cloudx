@@ -193,7 +193,7 @@ def main():
         "timestamp", "session_id", "label", "job_type",
         "cpu_pct", "mem_rss_mb", "io_read_mb", "io_write_mb",
         "num_alive_processes", "gpu_util_pct", "gpu_mem_util_pct",
-        "gpu_mem_used_mb_device", "gpu_mem_used_mb_process",
+        "gpu_mem_used_mb_device", "gpu_mem_used_mb_process", "gpu_mem_total_mb",
         "session_age_sec", "last_activity_age_sec", "gpu_alloc_sec",
     ] + list(extra_meta.keys())
 
@@ -208,6 +208,7 @@ def main():
             except psutil.NoSuchProcess:
                 pass
         time.sleep(interval_sec)
+        next_sample = time.time()
 
         while True:
             if not target_is_running(root_pid):
@@ -218,12 +219,14 @@ def main():
             if not pids:
                 break
 
+            # waktu sampel dicatat sebelum query nvidia-smi yang lamanya bervariasi
+            sampled_at = datetime.now(timezone.utc)
             proc_stats = get_process_cpu_mem_io(pids)
             gpu_dev = get_gpu_device_stats()
             gpu_proc_mem = get_process_gpu_memory_mb(pids)
 
             row = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": sampled_at.isoformat(),
                 "session_id": session_id, "label": label, "job_type": job_type,
                 "cpu_pct": round(proc_stats["cpu_pct"], 3),
                 "mem_rss_mb": round(proc_stats["mem_rss_mb"], 3),
@@ -234,12 +237,17 @@ def main():
                 "gpu_mem_util_pct": gpu_dev["gpu_mem_util_pct"],
                 "gpu_mem_used_mb_device": gpu_dev["gpu_mem_used_mb"],
                 "gpu_mem_used_mb_process": round(gpu_proc_mem, 3),
+                "gpu_mem_total_mb": gpu_dev["gpu_mem_total_mb"],
             }
             row.update(get_session_context(root_pid, gpu_requested))
             row.update(extra_meta)
             writer.writerow(row)
             f.flush()
-            time.sleep(interval_sec)
+            # Jadwal tetap: lama query nvidia-smi (lebih lambat saat GPU idle)
+            # tidak menggeser periode sampling, jadi jumlah baris per sesi
+            # hanya bergantung pada durasi, bukan skenario.
+            next_sample = max(next_sample + interval_sec, time.time())
+            time.sleep(max(0.0, next_sample - time.time()))
 
     with open("/data/DONE", "w") as f:
         f.write("done")

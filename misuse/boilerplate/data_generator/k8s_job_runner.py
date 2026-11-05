@@ -73,13 +73,15 @@ PROMETHEUS_QUERIES = {
     "pod_running": 'max(kube_pod_status_phase{%(pod)s,phase="Running"})',
     # Konteks cluster (Kajian CATS): antrean GPU untuk R1/P5, sesi per
     # pengguna untuk R6. Waiter/sibling dibuat runner -- lihat run_labeled_job.
+    # Hanya waiter milik sesi ini: waiter sesi sebelumnya masih bisa terbaca
+    # kube-state-metrics beberapa detik setelah dihapus.
     "queue_length": (
-        'count(kube_pod_status_phase{%(ns)s,pod=~"waiter-.*",phase="Pending"} == 1)'
+        'count(kube_pod_status_phase{%(ns)s,pod=~"%(waiters)s",phase="Pending"} == 1)'
         ' or vector(0)'
     ),
     "queue_wait_max_sec": (
-        'max((time() - kube_pod_created{%(ns)s,pod=~"waiter-.*"}) and on(pod)'
-        ' (kube_pod_status_phase{%(ns)s,pod=~"waiter-.*",phase="Pending"} == 1))'
+        'max((time() - kube_pod_created{%(ns)s,pod=~"%(waiters)s"}) and on(pod)'
+        ' (kube_pod_status_phase{%(ns)s,pod=~"%(waiters)s",phase="Pending"} == 1))'
         ' or vector(0)'
     ),
     "user_active_sessions": (
@@ -190,6 +192,7 @@ def _fetch_prometheus_telemetry(session_id, pod_name, start, end, step_sec,
         "pod": f'namespace="{NAMESPACE}",pod="{pod_name}"',
         "ns": f'namespace="{NAMESPACE}"',
         "podname": pod_name,
+        "waiters": _waiter_name(pod_name, "[0-9]+"),
         "w": PROM_RATE_WINDOW,
     }
     series = {}
@@ -254,6 +257,31 @@ def _merge_telemetry_files(local_path, prometheus_path, merged_path,
 def _pod_name_from_session(session_id: str) -> str:
     # Nama Pod harus DNS-1123: lowercase, "_" tidak diizinkan -> ganti "-"
     return f"session-{session_id}".replace("_", "-").lower()
+
+
+def _waiter_name(pod_name, index):
+    """Nama Pod waiter ke-index milik sesi pod_name (juga dipakai sebagai
+    pola regex di query antrean, dengan index "[0-9]+")."""
+    return f"waiter-{pod_name[len('session-'):]}-{index}"
+
+
+def _record_failure(v1, pod_name, path, session_id, scenario, reason):
+    """Sesi gagal tidak disimpan sebagai data berlabel, karena perilakunya
+    belum tentu sesuai label. Alasan dan ekor log job dicatat di
+    <session_id>.failed.json; --resume mengulang sesi tersebut."""
+    log_tail = None
+    if v1 is not None:
+        try:
+            log_tail = v1.read_namespaced_pod_log(pod_name, NAMESPACE, container="job",
+                                                  tail_lines=40)
+        except client.ApiException:
+            pass
+    with open(path, "w") as f:
+        json.dump({"session_id": session_id, "scenario": scenario.name, "reason": reason,
+                   "time": datetime.now(timezone.utc).isoformat(),
+                   "job_log_tail": log_tail}, f, indent=1)
+    print(f"[k8s_job_runner] GAGAL -- {session_id}: {reason}; sesi tidak disimpan "
+          f"(lihat {path})")
 
 
 def build_pod_manifest(scenario: Scenario, session_id: str, args: list,
@@ -465,7 +493,7 @@ def run_labeled_job(scenario: Scenario, session_id: str, out_dir="data",
             if running_since is not None:
                 while waiter_offsets and time.time() - running_since >= waiter_offsets[0]:
                     waiter_offsets.pop(0)
-                    name = f"waiter-{pod_name[len('session-'):]}-{len(helper_pods) + 1}"
+                    name = _waiter_name(pod_name, len(helper_pods) + 1)
                     v1.create_namespaced_pod(namespace=NAMESPACE, body=_helper_pod_manifest(
                         name, session_id, "waiter", ["sleep", "infinity"],
                         {"limits": {"nvidia.com/gpu": "1"}},
@@ -479,17 +507,15 @@ def run_labeled_job(scenario: Scenario, session_id: str, out_dir="data",
     # Hapus waiter sebelum GPU dilepas, agar waiter tidak sempat berjalan
     _delete_pods(v1, helper_pods)
 
-    if job_state is None:
-        print(f"[k8s_job_runner] TIMEOUT/gagal -- job {session_id} tidak "
-              f"selesai dalam batas waktu.")
-        job_start = (pod.status.start_time if pod is not None and pod.status.start_time
-                     else datetime.fromtimestamp(start, timezone.utc))
-        job_end = datetime.now(timezone.utc)
-    else:
-        job_start, job_end = job_state.started_at, job_state.finished_at
-        if job_state.exit_code != 0:
-            print(f"[k8s_job_runner] WARNING: job {session_id} exit "
-                  f"code={job_state.exit_code} reason={job_state.reason}")
+    os.makedirs(out_dir, exist_ok=True)
+    failed_path = os.path.join(out_dir, f"{session_id}.failed.json")
+    if job_state is None or job_state.exit_code != 0:
+        reason = ("timeout: job tidak selesai dalam batas waktu" if job_state is None
+                  else f"exit code {job_state.exit_code} ({job_state.reason})")
+        _record_failure(v1, pod_name, failed_path, session_id, scenario, reason)
+        _delete_pods(v1, [pod_name])
+        return None
+    job_start, job_end = job_state.started_at, job_state.finished_at
 
     # Tunggu sidecar menulis penanda /data/DONE (tanda CSV siap diambil)
     done_deadline = time.time() + max(interval_sec * 3, 15)
@@ -503,7 +529,6 @@ def run_labeled_job(scenario: Scenario, session_id: str, out_dir="data",
             break
         time.sleep(2)
 
-    os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"{session_id}.csv")
     prometheus_path = os.path.join(out_dir, f"{session_id}.prometheus.csv")
     merged_path = os.path.join(out_dir, f"{session_id}.merged.csv")
@@ -512,14 +537,12 @@ def run_labeled_job(scenario: Scenario, session_id: str, out_dir="data",
                            out_path)
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or b"").decode(errors="replace").strip()
-        print(f"[k8s_job_runner] WARNING: gagal mengambil CSV telemetri dari "
-              f"{pod_name}: {detail or 'kubectl exec gagal'}")
-        out_path = None
+        _record_failure(v1, pod_name, failed_path, session_id, scenario,
+                        f"CSV telemetri tidak terambil: {detail or 'kubectl exec gagal'}")
+        _delete_pods(v1, [pod_name])
+        return None
 
-    try:
-        v1.delete_namespaced_pod(pod_name, NAMESPACE, grace_period_seconds=0)
-    except client.ApiException:
-        pass
+    _delete_pods(v1, [pod_name])
 
     # Data Pod tetap tersimpan di Prometheus setelah Pod dihapus.
     lag = PROM_SCRAPE_LAG_SEC - (datetime.now(timezone.utc) - job_end).total_seconds()
@@ -537,9 +560,13 @@ def run_labeled_job(scenario: Scenario, session_id: str, out_dir="data",
         print(f"[k8s_job_runner] WARNING: gagal query Prometheus "
               f"({PROMETHEUS_URL}): {exc}")
 
-    if out_path is not None:
-        _merge_telemetry_files(out_path, prometheus_path, merged_path,
-                               tolerance_sec=max(interval_sec, 5))
+    if not _merge_telemetry_files(out_path, prometheus_path, merged_path,
+                                  tolerance_sec=max(interval_sec, 5)):
+        _record_failure(None, pod_name, failed_path, session_id, scenario,
+                        "CSV telemetri kosong (sidecar tidak merekam sampel)")
+        return None
+    if os.path.exists(failed_path):
+        os.remove(failed_path)   # percobaan sebelumnya gagal, yang ini berhasil
 
     print(f"[k8s_job_runner] session={session_id} scenario={scenario.name} "
           f"label={scenario.label} -> {out_path}")

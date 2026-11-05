@@ -30,12 +30,10 @@ def main():
     # SENGAJA tidak membatasi diri ke claimed_quota_mb -- mensimulasikan
     # proses yang bypass mekanisme quota enforcement.
     n_floats = int(args.actual_alloc_mb * 1024 * 1024 / 4)
-    try:
-        # zeros (bukan empty): di CPU, empty tidak menyentuh halaman memori
-        _held = torch.zeros(n_floats, device=device)
-        bypass_success = True
-    except RuntimeError:
-        bypass_success = False
+    # zeros (bukan empty): di CPU, empty tidak menyentuh halaman memori.
+    # Tidak ditangkap: bila alokasi gagal, sesi tidak melampaui kuota, jadi
+    # job harus error agar runner tidak menyimpannya sebagai sesi R3.
+    _held = torch.zeros(n_floats, device=device)
 
     a = torch.randn(args.matrix_size, args.matrix_size, device=device)
     b = torch.randn(args.matrix_size, args.matrix_size, device=device)
@@ -50,7 +48,7 @@ def main():
             last_touch = time.time()
 
     print(f"[misuse_quota_exceed] claimed={args.claimed_quota_mb}MB "
-          f"actual={args.actual_alloc_mb}MB bypass_success={bypass_success}")
+          f"actual={args.actual_alloc_mb}MB")
 
 
 register(Scenario(

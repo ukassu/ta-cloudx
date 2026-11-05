@@ -10,7 +10,7 @@ import time
 
 import torch
 
-from scenario_base import LogWriter, Scenario, add_common_args, mem_frac
+from scenario_base import IDLE_MARGIN_SEC, LogWriter, Scenario, add_common_args, mem_frac
 from registry import register
 
 
@@ -50,6 +50,8 @@ register(Scenario(
         "duration_sec": (240, 600),
         "hold_mem_mb": mem_frac(0.05, 0.2),
     },
+    # kelas K2 mensyaratkan sesi tanpa aktivitas melewati ambang idle
+    min_duration_sec=lambda p, policy: policy["idle_timeout_sec"] + IDLE_MARGIN_SEC,
 ))
 
 

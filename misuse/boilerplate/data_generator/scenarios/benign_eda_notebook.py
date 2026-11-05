@@ -1,8 +1,9 @@
 """
 scenarios/benign_eda_notebook.py
 ===================================
-Job BENIGN: eksplorasi data ala notebook (pandas/numpy), CPU-bound dan
-GPU rendah/nol -- contoh "job wajar yang memang tidak butuh GPU tinggi".
+Job BENIGN: eksplorasi data ala notebook (pandas/numpy) diselingi jeda,
+CPU ringan-sedang dan GPU nol -- contoh "job wajar yang memang tidak
+butuh GPU" (setara workload preprocessing W3 pada evaluasi CloudX).
 """
 import argparse
 import time
@@ -45,7 +46,8 @@ register(Scenario(
     script_path="scenarios/benign_eda_notebook.py",
     default_args=["--duration-sec", "300"],
     timeout_sec=None,
-    description="CPU tinggi, GPU nyaris 0% -- penyeimbang kelas benign non-GPU.",
+    description="CPU ringan-sedang (olah data berkala), GPU 0% -- penyeimbang "
+                "kelas benign non-GPU.",
     params={
         "duration_sec": (180, 600),
         "rows": (50_000, 400_000),

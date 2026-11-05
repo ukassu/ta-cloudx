@@ -54,19 +54,35 @@ DEFAULT_REQUEST_PROFILES = [
 # ID pengguna pseudonim (Kajian CATS, Bagian 6.3)
 USER_POOL = [f"u{i:02d}" for i in range(1, 9)]
 PLAN_VERSION = 2
+# Metrik GPU sidecar level device: pemakaian GPU oleh proses lain (layar,
+# aplikasi, Pod sisa) ikut terhitung. Di atas batas ini runner memperingatkan.
+GPU_BASELINE_WARN_MB = 200
+GPU_BASELINE_WARN_PCT = 5
 
 
-def detect_mem_budget_mb():
+def detect_gpu():
+    """Nama, memori total, dan pemakaian GPU node saat runner mulai (mode
+    GPU); None di mode CPU atau bila nvidia-smi gagal."""
+    if os.environ.get("K8S_REQUEST_GPU", "false").lower() != "true":
+        return None
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name,memory.total,memory.used,utilization.gpu",
+             "--format=csv,noheader,nounits"],
+            text=True,
+        )
+        name, total, used, util = [x.strip() for x in out.splitlines()[0].split(",")]
+        return {"name": name, "memory_total_mb": int(total),
+                "baseline_memory_used_mb": int(used), "baseline_util_pct": int(util)}
+    except (OSError, subprocess.CalledProcessError, ValueError, IndexError):
+        print("[run_experiment] WARNING: nvidia-smi gagal, pakai CPU_MEM_BUDGET_MB")
+        return None
+
+
+def detect_mem_budget_mb(gpu):
     """Memori GPU node (MB) di mode GPU; selain itu CPU_MEM_BUDGET_MB."""
-    if os.environ.get("K8S_REQUEST_GPU", "false").lower() == "true":
-        try:
-            out = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-                text=True,
-            )
-            return int(out.splitlines()[0].strip())
-        except (OSError, subprocess.CalledProcessError, ValueError, IndexError):
-            print("[run_experiment] WARNING: nvidia-smi gagal, pakai CPU_MEM_BUDGET_MB")
+    if gpu is not None:
+        return gpu["memory_total_mb"]
     return int(os.environ.get("CPU_MEM_BUDGET_MB", "4096"))
 
 
@@ -123,6 +139,10 @@ def build_plan(scenarios, args, mem_budget_mb):
             params["duration_sec"] = int(args.duration_sec * scenario.duration_scale)
         elif "duration_sec" in params:
             params["duration_sec"] = max(30, int(params["duration_sec"] * args.duration_scale))
+        if scenario.min_duration_sec is not None:
+            # label bergantung ambang kebijakan (mis. R2 harus melewati ambang idle)
+            params["duration_sec"] = max(params["duration_sec"],
+                                         int(scenario.min_duration_sec(params, POLICY)))
         sessions.append({
             "session_id": f"{scenario.name}_{idx:04d}",
             "scenario": scenario.name,
@@ -178,6 +198,14 @@ def main():
 
     discover_scenarios()  # import semua modul di scenarios/ -> trigger register()
 
+    gpu = detect_gpu()
+    mem_budget_mb = detect_mem_budget_mb(gpu)
+    if gpu and (gpu["baseline_memory_used_mb"] > GPU_BASELINE_WARN_MB
+                or gpu["baseline_util_pct"] > GPU_BASELINE_WARN_PCT):
+        print(f"[run_experiment] WARNING: GPU sudah terpakai sebelum sesi mulai "
+              f"({gpu['baseline_memory_used_mb']} MB, {gpu['baseline_util_pct']}%) -- ikut "
+              f"terhitung di metrik GPU sidecar (layar, aplikasi lain, atau Pod sisa)")
+
     os.makedirs(args.out_dir, exist_ok=True)
     plan_path = os.path.join(args.out_dir, "plan.json")
     if args.resume:
@@ -187,6 +215,10 @@ def main():
             plan = json.load(f)
         print(f"[run_experiment] melanjutkan rencana {plan_path} "
               f"(argumen rencana di CLI diabaikan)")
+        if plan["mem_budget_mb"] != mem_budget_mb:
+            # parameter MB (memori ditahan, kuota) diundi dari memori mesin pembuat rencana
+            raise SystemExit(f"--resume: rencana dibuat untuk memori {plan['mem_budget_mb']} MB, "
+                             f"mesin ini {mem_budget_mb} MB -- buat rencana baru di --out-dir lain")
         if code_sha and plan.get("code_sha256") and plan["code_sha256"] != code_sha:
             print("[run_experiment] WARNING: kode skenario berubah sejak rencana dibuat; "
                   "sesi lanjutan memakai kode baru (dataset tidak lagi seragam)")
@@ -203,12 +235,12 @@ def main():
                 "Tidak ada skenario terdaftar -- pastikan folder scenarios/ "
                 "berisi file skenario yang memanggil registry.register()."
             )
-        mem_budget_mb = detect_mem_budget_mb()
         plan = {
             "version": PLAN_VERSION,
             "created": datetime.now(timezone.utc).isoformat(),
             "args": vars(args),
             "mem_budget_mb": mem_budget_mb,
+            "gpu": gpu,
             "code_sha256": code_sha,
             "sessions": build_plan(scenarios, args, mem_budget_mb),
         }
@@ -266,6 +298,12 @@ def main():
               f"  python run_experiment.py --executor {args.executor} --resume "
               f"--out-dir {args.out_dir}")
         raise SystemExit(130)
+
+    failed = [s["session_id"] for s in sessions
+              if os.path.exists(os.path.join(args.out_dir, f"{s['session_id']}.failed.json"))]
+    if failed:
+        print(f"[run_experiment] {len(failed)} sesi gagal, tidak masuk dataset "
+              f"(alasan di <session_id>.failed.json; ulangi dengan --resume): {failed}")
 
     merged = [os.path.join(args.out_dir, f"{s['session_id']}.merged.csv") for s in sessions]
     merged = [f for f in merged if os.path.exists(f) and os.path.getsize(f) > 0]

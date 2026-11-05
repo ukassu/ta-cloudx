@@ -9,12 +9,13 @@ dipegang melewati ambang idle. Beda dengan R1: memori GPU kecil
 last_activity_age_sec yang terus naik.
 """
 import argparse
+import math
 import random
 import time
 
 import torch
 
-from scenario_base import LogWriter, Scenario, add_common_args, touch_activity
+from scenario_base import IDLE_MARGIN_SEC, LogWriter, Scenario, add_common_args, touch_activity
 from registry import register
 
 
@@ -60,8 +61,12 @@ register(Scenario(
     label_class="K2",
     params={
         "duration_sec": (240, 600),
-        "active_fraction": (0.1, 0.35),  # idle >= 0.65 x 240 s > ambang 120 s
+        "active_fraction": (0.1, 0.35),
     },
+    # fase idle = durasi x (1 - active_fraction) harus melewati ambang idle,
+    # termasuk saat --duration-scale / --duration-sec memperpendek durasi
+    min_duration_sec=lambda p, policy: math.ceil(
+        (policy["idle_timeout_sec"] + IDLE_MARGIN_SEC) / (1 - p["active_fraction"])),
     queue_waiters=(0, 1),
     sibling_sessions=(0, 1),
 ))

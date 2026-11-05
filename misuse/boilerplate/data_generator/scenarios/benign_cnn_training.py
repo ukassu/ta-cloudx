@@ -2,8 +2,10 @@
 scenarios/benign_cnn_training.py
 ===================================
 Job BENIGN: training CNN kecil pada data sintetis. Pola telemetri yang
-diharapkan: GPU utilization naik-turun mengikuti siklus batch/epoch,
-I/O muncul saat checkpoint save (bila checkpoint diaktifkan).
+diharapkan: GPU utilization tinggi selama training, aktivitas notebook
+tiap epoch, I/O tulis saat checkpoint save (bila checkpoint diaktifkan).
+Satu epoch biasanya lebih pendek dari interval sampling 5 s, jadi siklus
+per epoch tidak terlihat di telemetri.
 """
 import argparse
 import time
@@ -82,7 +84,8 @@ register(Scenario(
     script_path="scenarios/benign_cnn_training.py",
     default_args=["--duration-sec", "300", "--steps-per-epoch", "300"],
     timeout_sec=None,  # berhenti sendiri setelah durasi habis
-    description="GPU util naik-turun siklik, I/O spike periodik saat checkpoint.",
+    description="GPU util tinggi selama training, aktivitas tiap epoch, "
+                "I/O tulis saat checkpoint (opsional).",
     params={
         "duration_sec": (180, 900),  # training sah bisa panjang (tumpang-tindih P5)
         "steps_per_epoch": (100, 500),
