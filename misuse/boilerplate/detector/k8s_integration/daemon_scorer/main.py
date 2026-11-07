@@ -44,24 +44,27 @@ PROMETHEUS_TIMEOUT_SEC = float(os.environ.get("PROMETHEUS_TIMEOUT_SEC", "5"))
 
 # Keep this order identical to the non-GPU columns used by
 # common.feature_engineering.NUMERIC_TELEMETRY_COLUMNS_NO_GPU.
+# pipeline!="otel": supporting/9-install-otel-collector.sh re-exports cAdvisor into
+# the same Prometheus; without it sum() counts both copies (same filter as
+# data_generator/k8s_job_runner.py PROM_SERIES_FILTER).
 PROMETHEUS_QUERIES = {
     "cpu_pct": (
         '100 * sum by (namespace, pod) (rate('
         'container_cpu_usage_seconds_total{namespace="%s",pod="%s",'
-        'container!="",container!="POD"}[5m]))'
+        'container!="",container!="POD",pipeline!="otel"}[5m]))'
     ),
     "mem_rss_mb": (
         'sum by (namespace, pod) (container_memory_working_set_bytes{'
-        'namespace="%s",pod="%s",container!="",container!="POD"}) / 1024 / 1024'
+        'namespace="%s",pod="%s",container!="",container!="POD",pipeline!="otel"}) / 1024 / 1024'
     ),
     "io_read_mb": (
         'sum by (namespace, pod) (rate(container_fs_reads_bytes_total{'
-        'namespace="%s",pod="%s",container!="",container!="POD"}[5m])) '
+        'namespace="%s",pod="%s",container!="",container!="POD",pipeline!="otel"}[5m])) '
         '/ 1024 / 1024'
     ),
     "io_write_mb": (
         'sum by (namespace, pod) (rate(container_fs_writes_bytes_total{'
-        'namespace="%s",pod="%s",container!="",container!="POD"}[5m])) '
+        'namespace="%s",pod="%s",container!="",container!="POD",pipeline!="otel"}[5m])) '
         '/ 1024 / 1024'
     ),
 }
