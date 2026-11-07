@@ -62,9 +62,16 @@ fi
 echo
 echo "=== Install kube-prometheus-stack ==="
 
+# Select ServiceMonitors/PodMonitors/rules of every release (NetObserv, OTel), not
+# only release=monitoring. 7-install-netobserv.sh patches the same selectors at
+# runtime; without these values a re-run of this script reverts that patch and
+# all netobserv_* metrics disappear.
 helm upgrade --install "${RELEASE}" \
     prometheus-community/kube-prometheus-stack \
-    --namespace "${NAMESPACE}"
+    --namespace "${NAMESPACE}" \
+    --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
+    --set prometheus.prometheusSpec.podMonitorSelectorNilUsesHelmValues=false \
+    --set prometheus.prometheusSpec.ruleSelectorNilUsesHelmValues=false
 
 
 echo

@@ -239,7 +239,13 @@ if [ "$COLLECT_CADVISOR" = "true" ]; then
             static_configs:
               - targets: ['\${env:SCRAPE_NODE_IP}:10250']
                 labels:
-                  node: '\${env:SCRAPE_NODE_NAME}'"
+                  node: '\${env:SCRAPE_NODE_NAME}'
+            metric_relabel_configs:
+              # cgroups without a pod (/, /kubepods, QoS slices, the other node's pods
+              # on a shared kernel), dropped by kube-prometheus-stack's kubelet job too
+              - source_labels: [id, pod]
+                regex: '.+;'
+                action: drop"
 fi
 
 if [ "$COLLECT_NODE_EXPORTER" = "true" ]; then
@@ -252,6 +258,12 @@ if [ "$COLLECT_NODE_EXPORTER" = "true" ]; then
                   node: '\${env:SCRAPE_NODE_NAME}'"
 fi
 
+# The gadget endpoint is an OTel SDK exporter. The receiver turns the labels of
+# its target_info (service_name, telemetry_sdk_*, and target labels such as node)
+# into resource attributes; after resource_to_telemetry_conversion they collide
+# with the receiver's service.name and the 'node' label on every series, and the
+# exporter drops EVERY gadget metric ("duplicate label names in constant and
+# variable labels"). target_info carries no data: drop it.
 if [ "$COLLECT_INSPEKTOR_GADGET" = "true" ]; then
     AGENT_JOBS="${AGENT_JOBS}
           - job_name: inspektor-gadget
@@ -272,7 +284,11 @@ if [ "$COLLECT_INSPEKTOR_GADGET" = "true" ]; then
                 replacement: \$\$1:${IG_METRICS_PORT}
                 target_label: __address__
               - source_labels: [__meta_kubernetes_pod_node_name]
-                target_label: node"
+                target_label: node
+            metric_relabel_configs:
+              - source_labels: [__name__]
+                regex: target_info
+                action: drop"
 fi
 
 if [ -n "$AGENT_JOBS" ]; then
@@ -297,7 +313,16 @@ if [ "$COLLECT_KUBE_STATE_METRICS" = "true" ]; then
             scrape_interval: ${OTEL_COLLECTION_INTERVAL}
             honor_labels: true
             static_configs:
-              - targets: ['${KSM_TARGET}']"
+              - targets: ['${KSM_TARGET}']
+            metric_relabel_configs:
+              # KSM's own service_name label (kube_ingress_path, webhook clientconfig
+              # metrics) collides with service.name -> service_name in the exporter,
+              # which then drops those families ('duplicate label names')
+              - action: labelmap
+                regex: service_name
+                replacement: ksm_service_name
+              - action: labeldrop
+                regex: service_name"
     CLUSTER_METRICS_RECEIVERS="[otlp, prometheus]"
 else
     CLUSTER_PROM_BLOCK=""
@@ -372,6 +397,12 @@ ports:
     enabled: true
     containerPort: 8889
     servicePort: 8889
+    protocol: TCP
+  # collector self-telemetry (otelcol_*), scraped by the PodMonitor 'metrics' endpoint
+  metrics:
+    enabled: true
+    containerPort: 8888
+    servicePort: 8888
     protocol: TCP
 
 resources:
@@ -454,6 +485,12 @@ ports:
     containerPort: 8889
     servicePort: 8889
     protocol: TCP
+  # collector self-telemetry (otelcol_*), scraped by the PodMonitor 'metrics' endpoint
+  metrics:
+    enabled: true
+    containerPort: 8888
+    servicePort: 8888
+    protocol: TCP
 
 resources:
   requests:
@@ -531,9 +568,13 @@ kubectl -n "$OTEL_NAMESPACE" rollout status "deployment/${CLUSTER_DEPLOY}" --tim
 # PROMETHEUS PODMONITOR (kube-prometheus-stack)
 # ============================================================
 #
-# honorLabels keeps job="cadvisor" / "node-exporter" / "kube-state-metrics" /
-# "inspektor-gadget" from the collector; pipeline="otel" separates these series
-# from the ones kube-prometheus-stack scrapes directly.
+# honorLabels keeps the labels of the re-exported series (namespace/pod/container
+# of the monitored workload). The collector's own namespace/pod/container become
+# collector_*, so series without those labels (pod-level cgroups, kubeletstats)
+# are not filled with the collector's. job is rewritten to "otel/<job>" and
+# pipeline="otel" is added, so kube-prometheus-stack rules, dashboards and alerts
+# (job="kube-state-metrics", job="node-exporter") ignore these copies. Queries
+# without a job selector must add pipeline!="otel" to avoid counting twice.
 
 if kubectl get crd podmonitors.monitoring.coreos.com >/dev/null 2>&1; then
     if [ -z "$PROM_STACK_RELEASE" ]; then
@@ -561,10 +602,23 @@ spec:
     - port: prom-exporter
       interval: ${OTEL_COLLECTION_INTERVAL}
       honorLabels: true
+      relabelings:
+        - sourceLabels: [namespace]
+          targetLabel: collector_namespace
+        - sourceLabels: [pod]
+          targetLabel: collector_pod
+        - sourceLabels: [container]
+          targetLabel: collector_container
+        - action: labeldrop
+          regex: namespace|pod|container
       metricRelabelings:
         - action: replace
           targetLabel: pipeline
           replacement: otel
+        - sourceLabels: [job]
+          regex: (.+)
+          targetLabel: job
+          replacement: otel/\$1
     - port: metrics
       interval: 30s
 EOF
@@ -633,6 +687,29 @@ check_source() {
     fi
 }
 
+# One check per source; any miss sets VERIFY_RESULT=partial
+run_source_checks() {
+    # Regex names tolerate unit suffixes added by the exporter
+    check_source true "kubeletstats" \
+        '{__name__=~"k8s_pod_cpu.*|k8s_pod_memory.*",pipeline="otel"}'
+    check_source true "hostmetrics" \
+        '{__name__=~"system_cpu.*|system_memory.*",pipeline="otel"}'
+    check_source true "k8s_cluster" \
+        '{__name__=~"k8s_pod_phase|k8s_namespace_phase",pipeline="otel"}'
+    check_source "$COLLECT_CADVISOR" "cadvisor" \
+        '{__name__=~"container_cpu_usage_seconds.*",job="otel/cadvisor",pipeline="otel"}'
+    check_source "$COLLECT_NODE_EXPORTER" "node-exporter" \
+        '{__name__=~"node_cpu_seconds.*",job="otel/node-exporter",pipeline="otel"}'
+    check_source "$COLLECT_KUBE_STATE_METRICS" "kube-state-metrics" \
+        '{__name__="kube_pod_status_phase",job="otel/kube-state-metrics",pipeline="otel"}'
+    # k8s_attributes adds service.namespace (job "otel/gadget/inspektor-gadget");
+    # otel_scope_name selects gadget data, not the daemon's go_*/process_* metrics
+    check_source "$COLLECT_INSPEKTOR_GADGET" "inspektor-gadget" \
+        '{job=~"otel/(.+/)?inspektor-gadget",pipeline="otel",otel_scope_name=~".+-metrics"}'
+    check_source true "self-telemetry" \
+        '{__name__=~"otelcol_.*"}'
+}
+
 VERIFY_RESULT="skipped"
 
 if [ "$PROM_VERIFY" = "true" ] && [ "$PODMONITOR_CREATED" = "true" ]; then
@@ -661,24 +738,21 @@ if [ "$PROM_VERIFY" = "true" ] && [ "$PODMONITOR_CREATED" = "true" ]; then
         done
 
         if [ "$VERIFY_RESULT" = "ok" ]; then
-            # Give the collectors' own scrape jobs one more cycle
-            sleep "$PROM_VERIFY_INTERVAL"
-            echo "==> Checking sources (pipeline=\"otel\")"
-            # Regex names tolerate unit suffixes added by the exporter
-            check_source true "kubeletstats" \
-                '{__name__=~"k8s_pod_cpu.*|k8s_pod_memory.*",pipeline="otel"}'
-            check_source true "hostmetrics" \
-                '{__name__=~"system_cpu.*|system_memory.*",pipeline="otel"}'
-            check_source true "k8s_cluster" \
-                '{__name__=~"k8s_pod_phase|k8s_namespace_phase",pipeline="otel"}'
-            check_source "$COLLECT_CADVISOR" "cadvisor" \
-                '{__name__=~"container_cpu_usage_seconds.*",job="cadvisor",pipeline="otel"}'
-            check_source "$COLLECT_NODE_EXPORTER" "node-exporter" \
-                '{__name__=~"node_cpu_seconds.*",job="node-exporter",pipeline="otel"}'
-            check_source "$COLLECT_KUBE_STATE_METRICS" "kube-state-metrics" \
-                '{__name__="kube_pod_status_phase",job="kube-state-metrics",pipeline="otel"}'
-            check_source "$COLLECT_INSPEKTOR_GADGET" "inspektor-gadget" \
-                '{job="inspektor-gadget",pipeline="otel",__name__!~"up|scrape_.*|target_info|otel_scope_info"}'
+            # On a re-run the old targets are already up, but a changed PodMonitor
+            # only takes effect after the operator rewrites the config secret and
+            # the kubelet syncs it into the Prometheus pod (~1-2 min): retry.
+            i=0
+            while :; do
+                # Give the collectors' own scrape jobs one more cycle
+                sleep "$PROM_VERIFY_INTERVAL"
+                VERIFY_RESULT="ok"
+                echo "==> Checking sources (pipeline=\"otel\")"
+                run_source_checks
+                [ "$VERIFY_RESULT" = "ok" ] && break
+                i=$((i + 1))
+                [ "$i" -ge "$PROM_VERIFY_RETRIES" ] && break
+                echo "    retrying: Prometheus may still be loading the new PodMonitor"
+            done
         else
             echo "WARN: not all collector targets are up after $((PROM_VERIFY_RETRIES * PROM_VERIFY_INTERVAL))s"
             echo "      check: ${PROMETHEUS_URL}/targets"
@@ -712,7 +786,7 @@ fi
 echo " Prometheus       : ${PROMETHEUS_URL} (verification: ${VERIFY_RESULT})"
 echo
 echo " Example queries (collector pipeline only):"
-echo "   sum by (namespace) (rate(container_cpu_usage_seconds_total{job=\"cadvisor\",pipeline=\"otel\",container!=\"\"}[2m]))"
+echo "   sum by (namespace) (rate(container_cpu_usage_seconds_total{job=\"otel/cadvisor\",pipeline=\"otel\",container!=\"\"}[2m]))"
 echo "   sum by (namespace, phase) (kube_pod_status_phase{pipeline=\"otel\"})"
 echo
 echo " Verify manually:"
