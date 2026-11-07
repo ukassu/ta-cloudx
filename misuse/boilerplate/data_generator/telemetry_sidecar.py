@@ -15,6 +15,9 @@ misuse_idle_hoarding, misuse_zombie_job, dsb otomatis menjadi alokasi
 RAM biasa (skenario memakai torch.zeros agar halaman memori benar-benar
 terpakai), sehingga tetap tertangkap oleh kolom mem_rss_mb.
 
+io_read_mb/io_write_mb dari psutil io_counters(); di kernel tanpa /proc/<pid>/io
+(mis. WSL2 6.18) diambil dari io.stat cgroup container job (lihat HAS_PROC_IO).
+
 Metrik Prometheus TIDAK diambil di sini: k8s_job_runner.py melakukan
 query_range dari host setelah job selesai, supaya traffic query sidecar
 tidak ikut terhitung di metrik network Pod.
@@ -50,6 +53,10 @@ def _run(cmd):
         return subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True).strip()
     except Exception:
         return ""
+
+
+def _round(value):
+    return None if value is None else round(value, 3)
 
 
 def get_gpu_device_stats():
@@ -127,6 +134,31 @@ def _process(pid):
     return proc
 
 
+# Kernel tanpa CONFIG_TASK_IO_ACCOUNTING (mis. kernel WSL2 6.18 di PC lab) tidak
+# punya /proc/<pid>/io, sehingga psutil tidak menyediakan Process.io_counters().
+HAS_PROC_IO = hasattr(psutil.Process, "io_counters")
+
+
+def get_cgroup_io_mb(pid):
+    """(read_mb, write_mb) kumulatif dari io.stat cgroup container proses pid --
+    byte yang benar-benar sampai ke storage, sumber yang sama dengan
+    container_fs_{reads,writes}_bytes_total cAdvisor. Dibaca lewat /proc/<pid>/root
+    karena sidecar berada di cgroup namespace lain. None bila tidak terbaca."""
+    rbytes = wbytes = 0
+    try:
+        with open(f"/proc/{pid}/root/sys/fs/cgroup/io.stat") as f:
+            for line in f:                      # "8:48 rbytes=.. wbytes=.. rios=.."
+                for field in line.split()[1:]:
+                    key, _, value = field.partition("=")
+                    if key == "rbytes":
+                        rbytes += int(value)
+                    elif key == "wbytes":
+                        wbytes += int(value)
+    except (OSError, ValueError):
+        return None
+    return rbytes / (1024 ** 2), wbytes / (1024 ** 2)
+
+
 def get_process_cpu_mem_io(pids):
     cpu_pct = mem_rss_mb = io_read_mb = io_write_mb = 0.0
     alive = 0
@@ -135,13 +167,18 @@ def get_process_cpu_mem_io(pids):
             p = _process(pid)
             cpu_pct += p.cpu_percent(interval=None)
             mem_rss_mb += p.memory_info().rss / (1024 ** 2)
-            io = p.io_counters()
-            io_read_mb += io.read_bytes / (1024 ** 2)
-            io_write_mb += io.write_bytes / (1024 ** 2)
+            if HAS_PROC_IO:
+                io = p.io_counters()
+                io_read_mb += io.read_bytes / (1024 ** 2)
+                io_write_mb += io.write_bytes / (1024 ** 2)
             alive += 1
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             _PROCS.pop(pid, None)
             continue
+    if not HAS_PROC_IO:
+        # Semua proses job ada di cgroup container yang sama; pids[0] = proses root job
+        io = get_cgroup_io_mb(pids[0]) if pids else None
+        io_read_mb, io_write_mb = io if io else (None, None)
     return {"cpu_pct": cpu_pct, "mem_rss_mb": mem_rss_mb,
              "io_read_mb": io_read_mb, "io_write_mb": io_write_mb,
              "num_alive_processes": alive}
@@ -186,8 +223,8 @@ def main():
         print("[telemetry_sidecar] proses target tidak ditemukan, keluar.", flush=True)
         sys.exit(1)
 
-    print(f"[telemetry_sidecar] target ditemukan pid={root_pid}, mulai rekam.",
-          flush=True)
+    print(f"[telemetry_sidecar] target ditemukan pid={root_pid}, mulai rekam "
+          f"(sumber io: {'psutil' if HAS_PROC_IO else 'cgroup io.stat'}).", flush=True)
 
     fieldnames = [
         "timestamp", "session_id", "label", "job_type",
@@ -230,8 +267,8 @@ def main():
                 "session_id": session_id, "label": label, "job_type": job_type,
                 "cpu_pct": round(proc_stats["cpu_pct"], 3),
                 "mem_rss_mb": round(proc_stats["mem_rss_mb"], 3),
-                "io_read_mb": round(proc_stats["io_read_mb"], 3),
-                "io_write_mb": round(proc_stats["io_write_mb"], 3),
+                "io_read_mb": _round(proc_stats["io_read_mb"]),
+                "io_write_mb": _round(proc_stats["io_write_mb"]),
                 "num_alive_processes": proc_stats["num_alive_processes"],
                 "gpu_util_pct": gpu_dev["gpu_util_pct"],
                 "gpu_mem_util_pct": gpu_dev["gpu_mem_util_pct"],

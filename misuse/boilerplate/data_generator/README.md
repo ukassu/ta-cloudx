@@ -189,6 +189,7 @@ Konfigurasi lewat environment variable:
 | `PROMETHEUS_URL` | `http://prometheus.127.0.0.1.sslip.io` | URL Prometheus dari host |
 | `PROM_RATE_WINDOW` | `1m` | jendela `rate()`; minimal 2x scrape interval cAdvisor (10s) |
 | `PROM_SCRAPE_LAG_SEC` | `25` | jeda setelah job selesai sebelum query, agar scrape terakhir masuk |
+| `PROM_REQUIRED` | `false` | `true` = sesi yang tetap tanpa metrik Prometheus setelah 3 percobaan dicatat gagal (`.failed.json`) dan diulang `--resume` |
 | `K8S_REQUEST_GPU` | `false` | `true` = container job meminta `nvidia.com/gpu: 1`, sidecar membaca `nvidia-smi` |
 | `JOB_IMAGE` | `local/data-generator-job:latest` | pakai `local/data-generator-job:gpu` (torch CUDA) saat mode GPU |
 | `CODE_SOURCE` | `configmap` | kode skenario/sidecar dikirim lewat ConfigMap `data-generator-code` dan di-mount ke `/app`; `image` = pakai kode yang dibake di image |
@@ -209,9 +210,19 @@ File `.merged.csv` memiliki kolom lokal (`cpu_pct`, `mem_rss_mb`, dan
 sebagainya), ditambah kolom Prometheus dengan prefix `prom_`. Metrik
 CPU, memory, I/O, restart, dan request/limit hanya dari container
 `job` (sidecar tidak ikut terhitung); metrik network bersifat per Pod.
-Jika suatu metrik tidak tersedia, nilainya kosong; jika Prometheus
-tidak dapat diakses, data `psutil` tetap tersimpan dan kolom `prom_*`
-kosong.
+Jika suatu metrik tidak tersedia, nilainya kosong. Query Prometheus
+diulang hingga 3 kali bila gagal (DNS/ingress) atau belum ada data
+container `job`. Bila tetap gagal, data `psutil` tetap tersimpan dan
+kolom `prom_*` kosong; dengan `PROM_REQUIRED=true` sesi itu dicatat gagal
+dan diulang `--resume`, sehingga dataset tidak berisi sesi tanpa metrik
+Prometheus (missingness seperti itu bisa berkorelasi dengan label).
+
+Query runner hanya membaca series yang di-scrape langsung oleh
+kube-prometheus-stack (filter `pipeline!="otel"`, `PROM_SERIES_FILTER` di
+`k8s_job_runner.py`). `supporting/9-install-otel-collector.sh` mengekspor
+ulang cAdvisor dan kube-state-metrics ke Prometheus yang sama dengan label
+`pipeline="otel"`; tanpa filter, `sum()`/`count()` menjumlahkan dua salinan
+sehingga hampir semua kolom `prom_*` bernilai 2x.
 
 Perbedaan semantik kolom lokal vs Prometheus:
 
@@ -220,6 +231,12 @@ Perbedaan semantik kolom lokal vs Prometheus:
 | `cpu_pct` (100 = 1 core, sesaat) | `prom_cpu_pct` (100 = 1 core, rata-rata `PROM_RATE_WINDOW`) | Prometheus lebih halus/tertinggal |
 | `mem_rss_mb` (RSS proses) | `prom_mem_rss_mb` (working set container) | nilai mirip |
 | `io_read_mb`, `io_write_mb` (**kumulatif** MB) | `prom_io_read_mb`, `prom_io_write_mb` (**laju** MB/s) | jangan dicampur |
+
+Kernel tanpa `/proc/<pid>/io` (`CONFIG_TASK_IO_ACCOUNTING` mati, misalnya
+kernel WSL2 6.18 di PC lab) membuat psutil tidak punya `io_counters()`. Di
+kernel seperti itu sidecar mengisi `io_read_mb`/`io_write_mb` dari `io.stat`
+cgroup container `job` (byte kumulatif yang sampai ke storage, sumber yang sama
+dengan cAdvisor), dan log sidecar menyebut `sumber io: cgroup io.stat`.
 
 ## Metadata tambahan per skenario
 

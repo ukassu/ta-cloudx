@@ -48,8 +48,21 @@ PROMETHEUS_TIMEOUT_SEC = float(os.environ.get("PROMETHEUS_TIMEOUT_SEC", "10"))
 PROM_RATE_WINDOW = os.environ.get("PROM_RATE_WINDOW", "1m")
 # Tunggu sampel scrape terakhir masuk ke Prometheus sebelum query_range.
 PROM_SCRAPE_LAG_SEC = float(os.environ.get("PROM_SCRAPE_LAG_SEC", "25"))
+# Query diulang bila gagal (DNS/ingress sesaat) atau belum ada data container job.
+PROM_FETCH_ATTEMPTS = 3
+PROM_RETRY_SEC = 15.0
+# true = sesi yang tetap tanpa metrik Prometheus dicatat gagal (.failed.json) dan
+# diulang --resume, agar dataset tidak berisi sesi dengan kolom prom_* kosong;
+# false = sesi disimpan dengan kolom prom_* kosong (cocok untuk cluster tanpa Prometheus).
+PROM_REQUIRED = os.environ.get("PROM_REQUIRED", "false").lower() == "true"
 # File heartbeat aktivitas notebook di volume bersama (scenario_base.touch_activity)
 ACTIVITY_FILE = "/data/last_activity"
+
+# supporting/9-install-otel-collector.sh mengekspor ulang cAdvisor dan
+# kube-state-metrics ke Prometheus yang sama dengan label pipeline="otel".
+# Tanpa filter ini sum()/count() menjumlahkan dua salinan -> nilai prom_* 2x.
+# Series tanpa label pipeline (scrape langsung kube-prometheus-stack) tetap cocok.
+PROM_SERIES_FILTER = 'pipeline!="otel"'
 
 # %(job)s = hanya container job (sidecar telemetri tidak ikut terhitung).
 # %(pod)s = level Pod; metrik network memang tidak punya label container.
@@ -186,11 +199,13 @@ def _prometheus_query_range(query, start, end, step_sec):
 
 def _fetch_prometheus_telemetry(session_id, pod_name, start, end, step_sec,
                                 out_path):
-    """Tulis <session_id>.prometheus.csv; return jumlah baris (0 = kosong)."""
+    """Tulis <session_id>.prometheus.csv; return jumlah titik prom_mem_rss_mb
+    (0 = Prometheus tidak punya data container job). Jumlah baris CSV tidak
+    dipakai karena query 'or vector(0)' selalu menghasilkan nilai."""
     selectors = {
-        "job": f'namespace="{NAMESPACE}",pod="{pod_name}",container="job"',
-        "pod": f'namespace="{NAMESPACE}",pod="{pod_name}"',
-        "ns": f'namespace="{NAMESPACE}"',
+        "job": f'namespace="{NAMESPACE}",pod="{pod_name}",container="job",{PROM_SERIES_FILTER}',
+        "pod": f'namespace="{NAMESPACE}",pod="{pod_name}",{PROM_SERIES_FILTER}',
+        "ns": f'namespace="{NAMESPACE}",{PROM_SERIES_FILTER}',
         "podname": pod_name,
         "waiters": _waiter_name(pod_name, "[0-9]+"),
         "w": PROM_RATE_WINDOW,
@@ -216,7 +231,26 @@ def _fetch_prometheus_telemetry(session_id, pod_name, start, end, step_sec,
                 value = values.get(ts)
                 row[f"prom_{name}"] = round(value, 6) if value is not None else None
             writer.writerow(row)
-    return len(timestamps)
+    return len(series["mem_rss_mb"])
+
+
+def _fetch_prometheus_with_retry(session_id, pod_name, start, end, step_sec, out_path):
+    """_fetch_prometheus_telemetry dengan pengulangan. Return None bila berhasil,
+    atau pesan error percobaan terakhir."""
+    error = None
+    for attempt in range(1, PROM_FETCH_ATTEMPTS + 1):
+        try:
+            if _fetch_prometheus_telemetry(session_id, pod_name, start, end,
+                                           step_sec, out_path) > 0:
+                return None
+            error = f"Prometheus tidak punya data container job {pod_name}"
+        except (OSError, ValueError, RuntimeError) as exc:
+            error = f"gagal query Prometheus ({PROMETHEUS_URL}): {exc}"
+        print(f"[k8s_job_runner] WARNING: {error} "
+              f"(percobaan {attempt}/{PROM_FETCH_ATTEMPTS})")
+        if attempt < PROM_FETCH_ATTEMPTS:
+            time.sleep(PROM_RETRY_SEC * attempt)
+    return error
 
 
 def _merge_telemetry_files(local_path, prometheus_path, merged_path,
@@ -548,17 +582,16 @@ def run_labeled_job(scenario: Scenario, session_id: str, out_dir="data",
     lag = PROM_SCRAPE_LAG_SEC - (datetime.now(timezone.utc) - job_end).total_seconds()
     if lag > 0:
         time.sleep(lag)
-    try:
-        n_rows = _fetch_prometheus_telemetry(
-            session_id, pod_name, job_start, job_end, interval_sec,
-            prometheus_path,
-        )
-        if n_rows == 0:
-            print(f"[k8s_job_runner] WARNING: Prometheus tidak punya data "
-                  f"untuk {pod_name}; kolom prom_* akan kosong")
-    except (OSError, ValueError, RuntimeError) as exc:
-        print(f"[k8s_job_runner] WARNING: gagal query Prometheus "
-              f"({PROMETHEUS_URL}): {exc}")
+    prom_error = _fetch_prometheus_with_retry(
+        session_id, pod_name, job_start, job_end, interval_sec, prometheus_path,
+    )
+    if prom_error and PROM_REQUIRED:
+        _record_failure(None, pod_name, failed_path, session_id, scenario,
+                        f"metrik Prometheus tidak terambil: {prom_error}")
+        return None
+    if prom_error:
+        print("[k8s_job_runner] WARNING: kolom prom_* sesi ini akan kosong "
+              "(PROM_REQUIRED=true untuk mencatatnya sebagai gagal)")
 
     if not _merge_telemetry_files(out_path, prometheus_path, merged_path,
                                   tolerance_sec=max(interval_sec, 5)):
