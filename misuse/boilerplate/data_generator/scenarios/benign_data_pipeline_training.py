@@ -49,6 +49,8 @@ def main():
     ap.add_argument("--batch-size", type=int, default=128)
     ap.add_argument("--checkpoint-every", type=int, default=1,
                     help="checkpoint tiap N epoch (0 = tidak pernah)")
+    ap.add_argument("--train-sec-per-shard", type=float, default=10.0,
+                    help="lama training (detik) per shard yang dimuat")
     add_common_args(ap)
     args = ap.parse_args()
     log = LogWriter(args.log_every_sec, args.log_kb)
@@ -71,16 +73,22 @@ def main():
         for path in paths:
             if time.time() - start >= args.duration_sec:
                 break
+            # fase data loading (disk + augmentasi CPU): GPU turun sesaat
             data = read_shard(path)
             data = np.flip(data, axis=3) if epoch % 2 else data   # augmentasi CPU
             data = (data - data.mean()) / (data.std() + 1e-6)
-            x_all = torch.from_numpy(np.ascontiguousarray(data))
-            for i in range(0, len(x_all), args.batch_size):
-                x = x_all[i:i + args.batch_size].to(device)
-                y = torch.randint(0, 10, (len(x),), device=device)
-                opt.zero_grad()
-                loss_fn(model(x), y).backward()
-                opt.step()
+            x_all = torch.from_numpy(np.ascontiguousarray(data)).to(device)
+            # Training per shard berbasis waktu: satu kali lewat shard hanya
+            # puluhan step kecil, sehingga di GPU cepat job jadi CPU-bound
+            # (GPU ~30-40%, mirip R7). Dengan anggaran waktu GPU tetap dominan.
+            shard_until = time.time() + args.train_sec_per_shard
+            while time.time() < shard_until and time.time() - start < args.duration_sec:
+                for i in range(0, len(x_all), args.batch_size):
+                    x = x_all[i:i + args.batch_size]
+                    y = torch.randint(0, 10, (len(x),), device=device)
+                    opt.zero_grad()
+                    loss_fn(model(x), y).backward()
+                    opt.step()
             touch_activity()
             log.tick()
         model.eval()
@@ -109,6 +117,7 @@ register(Scenario(
         "samples_per_shard": (1024, 4096),
         "batch_size": [64, 128, 256],
         "checkpoint_every": [0, 1, 2],
+        "train_sec_per_shard": (5.0, 20.0),
     },
     queue_waiters=(0, 2),
 ))

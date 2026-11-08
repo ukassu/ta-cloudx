@@ -18,6 +18,11 @@ terpakai), sehingga tetap tertangkap oleh kolom mem_rss_mb.
 io_read_mb/io_write_mb dari psutil io_counters(); di kernel tanpa /proc/<pid>/io
 (mis. WSL2 6.18) diambil dari io.stat cgroup container job (lihat HAS_PROC_IO).
 
+gpu_util_pct/gpu_mem_util_pct = rata-rata bacaan nvidia-smi tiap 200 ms selama
+interval sampling (GpuSampler), bukan satu bacaan sesaat: utilization.gpu hanya
+mencakup jendela pendek (~1/6 s di WSL2), sehingga satu bacaan per 5 s ter-alias
+(uji di PC lab: beban duty 74% terbaca 96%, burst 6% terbaca 0%).
+
 Metrik Prometheus TIDAK diambil di sini: k8s_job_runner.py melakukan
 query_range dari host setelah job selesai, supaya traffic query sidecar
 tidak ikut terhitung di metrik network Pod.
@@ -38,6 +43,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -72,6 +78,51 @@ def get_gpu_device_stats():
     parts = [p.strip() for p in out.split(",")]
     return {"gpu_util_pct": float(parts[0]), "gpu_mem_util_pct": float(parts[1]),
              "gpu_mem_used_mb": float(parts[2]), "gpu_mem_total_mb": float(parts[3])}
+
+
+class GpuSampler:
+    """nvidia-smi persisten (-lms) di thread latar. interval_stats() memberi
+    rata-rata utilisasi sejak pemanggilan sebelumnya dan memori terakhir, atau
+    None bila tidak ada bacaan (tanpa GPU / nvidia-smi gagal -> pemanggil
+    memakai get_gpu_device_stats())."""
+
+    def __init__(self, period_ms=200):
+        self._rows = []
+        self._lock = threading.Lock()
+        try:
+            self._proc = subprocess.Popen(
+                ["nvidia-smi", "-i", "0",
+                 "--query-gpu=utilization.gpu,utilization.memory,memory.used,memory.total",
+                 "--format=csv,noheader,nounits", "-lms", str(period_ms)],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        except OSError:
+            self._proc = None
+            return
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        for line in self._proc.stdout:
+            try:
+                row = [float(p) for p in line.split(",")[:4]]
+            except ValueError:
+                continue   # mis. "[N/A]"
+            if len(row) == 4:
+                with self._lock:
+                    self._rows.append(row)
+
+    def interval_stats(self):
+        with self._lock:
+            rows, self._rows = self._rows, []
+        if not rows:
+            return None
+        n = len(rows)
+        return {"gpu_util_pct": round(sum(r[0] for r in rows) / n, 1),
+                "gpu_mem_util_pct": round(sum(r[1] for r in rows) / n, 1),
+                "gpu_mem_used_mb": rows[-1][2], "gpu_mem_total_mb": rows[-1][3]}
+
+    def stop(self):
+        if self._proc is not None:
+            self._proc.terminate()
 
 
 def get_process_gpu_memory_mb(pids):
@@ -239,6 +290,7 @@ def main():
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
 
+        gpu_sampler = GpuSampler()   # mulai sekarang: interval pertama ikut dirata-rata
         for pid in collect_pid_tree(root_pid):
             try:
                 _process(pid)
@@ -259,7 +311,7 @@ def main():
             # waktu sampel dicatat sebelum query nvidia-smi yang lamanya bervariasi
             sampled_at = datetime.now(timezone.utc)
             proc_stats = get_process_cpu_mem_io(pids)
-            gpu_dev = get_gpu_device_stats()
+            gpu_dev = gpu_sampler.interval_stats() or get_gpu_device_stats()
             gpu_proc_mem = get_process_gpu_memory_mb(pids)
 
             row = {
@@ -285,6 +337,7 @@ def main():
             # hanya bergantung pada durasi, bukan skenario.
             next_sample = max(next_sample + interval_sec, time.time())
             time.sleep(max(0.0, next_sample - time.time()))
+        gpu_sampler.stop()
 
     with open("/data/DONE", "w") as f:
         f.write("done")

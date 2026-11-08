@@ -235,16 +235,21 @@ semua sesi:
 
 - **Definisi Kajian:** sama dengan S1. Varian berosilasi tidak dijelaskan
   di Kajian, jadi ini perluasan.
-- **Implementasi:** intensitas GPU mengikuti gelombang sinus dengan
-  periode 30–120 s, tanpa aktivitas notebook.
+- **Implementasi:** intensitas GPU (porsi waktu sibuk per siklus 0,5 s)
+  mengikuti gelombang sinus antara `min_intensity` (0,1–0,4) dan
+  `max_intensity` (0,7–1,0) dengan periode 30–120 s, tanpa aktivitas
+  notebook. `min_duration_sec` = 2 × periode + 30 s, sehingga cek
+  periodisitas selalu punya dua periode, juga dengan `--duration-scale 0.5`
+  atau `--duration-sec` uji cepat.
 - **Rujukan pendukung:** [TEKINER21] membahas teknik evasi dan obfuskasi
   cryptojacking.
-- **Celah:** pada audit dataset v1, osilasinya nyaris tidak terlihat
-  karena beban per siklus terlalu kecil (cek `pola_periodik` gagal di 9 dari
-  10 sesi). Kode v2 memperbesar beban, tetapi belum diverifikasi. Cek
-  periodisitas butuh sesi minimal dua periode; sesi yang lebih pendek
-  (mis. uji cepat 60 s, atau periode panjang dengan `--duration-scale 0.5`)
-  berstatus *tidak lengkap* dan tidak masuk `dataset_verified.csv`.
+- **Celah:** v1/v2 menghitung beban sebagai jumlah perkalian matriks per
+  siklus, sehingga besarnya bergantung kecepatan GPU: osilasi nyaris tidak
+  terlihat di dataset v1, dan di RTX 5060 Ti (PC lab) hanya ~1–17% GPU (cek
+  `pola_periodik` gagal pada sesi 300 s, ACF −0,34). Versi berbasis waktu
+  diverifikasi di PC lab: sinus 35↔90% dengan periode 92 s, ACF 0,99. Sinus
+  juga tampak di `cpu_pct`, karena `torch.cuda.synchronize()` menunggu
+  dengan spin-wait (miner sungguhan memakai sedikit CPU host).
 
 ## Rincian skenario benign
 
@@ -273,8 +278,15 @@ besar, memori GPU tinggi hampir selalu berarti misuse dalam data ini.
 
 ### `benign_data_pipeline_training`
 
-- **Pola:** membaca shard dari disk, augmentasi di CPU, training, evaluasi,
-  checkpoint opsional; GPU turun sesaat ketika data dimuat.
+- **Pola:** membaca shard dari disk, augmentasi di CPU, training berbasis
+  waktu per shard (`train_sec_per_shard` 5–20 s), evaluasi, checkpoint
+  opsional; GPU turun sesaat ketika shard dimuat dan I/O baca muncul per
+  shard. Dulu tiap shard hanya dilatih satu kali lewat (puluhan step kecil),
+  sehingga di GPU cepat job menjadi CPU-bound: di PC lab GPU 32–41% dengan
+  CPU 1 core penuh dan baca disk ~400 MB/s terus-menerus, yang memenuhi
+  definisi R7. Setelah perbaikan (PC lab): GPU 91–93%, baca ~1,3 MB/s. Dip
+  saat loading (~0,1 s per shard) terlalu singkat untuk terlihat di sampel
+  5 s.
 - **Rujukan:** [CLOUDX26] W1; [GAO24]: operasi data adalah penyebab umum
   utilisasi GPU rendah. Di sini menjadi pembanding sah untuk R1 dan R7.
 

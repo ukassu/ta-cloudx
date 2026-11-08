@@ -238,6 +238,15 @@ kernel seperti itu sidecar mengisi `io_read_mb`/`io_write_mb` dari `io.stat`
 cgroup container `job` (byte kumulatif yang sampai ke storage, sumber yang sama
 dengan cAdvisor), dan log sidecar menyebut `sumber io: cgroup io.stat`.
 
+`gpu_util_pct` dan `gpu_mem_util_pct` adalah rata-rata bacaan nvidia-smi
+tiap 200 ms selama interval sampling (bukan satu bacaan sesaat);
+`gpu_mem_used_mb_device` dan `gpu_mem_total_mb` adalah bacaan terakhir di
+interval itu. Alasannya: `utilization.gpu` hanya mencakup jendela pendek
+(~1/6 s di WSL2), sehingga satu bacaan per 5 s ter-alias dengan beban
+berperiode. Uji di PC lab: beban duty 74% (siklus 1 s) terbaca 96% dengan
+satu bacaan vs 70% dengan rata-rata; burst 0,3 s tiap 5 s (6%) terbaca 0%
+vs 5,7%.
+
 ## Metadata tambahan per skenario
 
 Metadata statis yang perlu ikut menjadi kolom CSV ditaruh di
