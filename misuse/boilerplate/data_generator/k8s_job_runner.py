@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import subprocess
 import time
 import urllib.parse
@@ -179,6 +180,24 @@ def _kubectl_copy_file(pod_name, container, src_in_pod, dst_local):
         output.write(result.stdout)
 
 
+# Nama *.<a.b.c.d>.sslip.io / nip.io selalu berarti alamat a.b.c.d: sambung langsung
+# ke IP itu dengan header Host (dipakai ingress) agar query tidak bergantung DNS
+# internet -- 12 sesi run data-v3-20261107 gagal karena "Temporary failure in name
+# resolution" saat jaringan lab terganggu.
+_EMBEDDED_IP_HOST = re.compile(r"(?:^|\.)(\d{1,3}(?:\.\d{1,3}){3})\.(?:sslip|nip)\.io$")
+
+
+def _prometheus_request(url):
+    parts = urllib.parse.urlsplit(url)
+    match = _EMBEDDED_IP_HOST.search(parts.hostname or "")
+    if not match:
+        return urllib.request.Request(url)
+    netloc = match.group(1) + (f":{parts.port}" if parts.port else "")
+    request = urllib.request.Request(urllib.parse.urlunsplit(parts._replace(netloc=netloc)))
+    request.add_header("Host", parts.netloc)
+    return request
+
+
 def _prometheus_query_range(query, start, end, step_sec):
     params = urllib.parse.urlencode({
         "query": query, "start": start.timestamp(), "end": end.timestamp(),
@@ -187,7 +206,7 @@ def _prometheus_query_range(query, start, end, step_sec):
     url = f"{PROMETHEUS_URL.rstrip('/')}/api/v1/query_range?{params}"
     # URL lokal (127.0.0.1) -- jangan lewat HTTP(S)_PROXY dari shell
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(url, timeout=PROMETHEUS_TIMEOUT_SEC) as response:
+    with opener.open(_prometheus_request(url), timeout=PROMETHEUS_TIMEOUT_SEC) as response:
         payload = json.load(response)
     if payload.get("status") != "success":
         raise RuntimeError(f"respons Prometheus gagal: {payload}")

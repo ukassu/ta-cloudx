@@ -115,7 +115,10 @@ register(Scenario(
         "duration_sec": (180, 900),
         "shards": (4, 12),
         "samples_per_shard": (1024, 4096),
-        "batch_size": [64, 128, 256],
+        # batch 64 dihapus: di GPU cepat step-nya terbatas kecepatan launch kernel
+        # (GPU ~57%, CPU 1 core penuh) sehingga sesi benign memenuhi definisi R7
+        # (run data-v3-20261107: 14 sesi). Batch 128/256: GPU 91-98%.
+        "batch_size": [128, 256],
         "checkpoint_every": [0, 1, 2],
         "train_sec_per_shard": (5.0, 20.0),
     },

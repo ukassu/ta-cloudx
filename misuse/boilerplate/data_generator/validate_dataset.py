@@ -225,6 +225,18 @@ def chk_gpu_low(v):
     return None if s is None else bool(s.mean() <= LOW_GPU_PCT)
 
 
+def chk_not_r7(v):
+    """Sesi benign tidak boleh memenuhi definisi R7 (CPU ~1 core penuh, GPU rendah).
+    Di GPU cepat, training dengan batch kecil terbatas kecepatan launch kernel dan
+    terlihat persis seperti R7 (run data-v3-20261107: 15 sesi benign vs 4 sesi R7)."""
+    busy, low = chk_cpu_busy(v), chk_gpu_low(v)
+    if busy is NA or low is NA:
+        return NA   # mode CPU: R7 (GPU rendah) tidak berlaku
+    if busy is None or low is None:
+        return None
+    return not (busy and low)
+
+
 def chk_high_load(v):
     s = v.util()
     return None if s is None else bool(s.median() >= HIGH_UTIL_PCT)
@@ -254,7 +266,7 @@ GT_CHECKS = {
     "P5": {"antrean_naik": chk_queue_rising},
     "S1": {"beban_tinggi": chk_high_load, "tanpa_aktivitas_lanjutan": chk_no_later_activity},
     "BENIGN": {"di_bawah_kuota": chk_within_quota, "tidak_melewati_idle": chk_not_idle,
-               "sesi_dalam_batas": chk_sessions_within},
+               "sesi_dalam_batas": chk_sessions_within, "bukan_pola_R7": chk_not_r7},
 }
 GT_CHECKS_BY_JOB = {
     # beban rata-ratanya tidak harus tinggi; yang dicek periodisitasnya

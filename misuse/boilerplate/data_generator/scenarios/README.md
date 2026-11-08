@@ -78,7 +78,7 @@ didefinisikan di bagian atas cek ground truth di `validate_dataset.py`.
 | P5 | antrean di sepertiga akhir sesi lebih panjang dari sepertiga awal |
 | S1 `synthetic_load` | median utilisasi ≥ 60%, tanpa aktivitas setelah awal sesi |
 | S1 `disguised_pattern` | autokorelasi utilisasi pada periode yang disuntikkan ≥ 0.3, tanpa aktivitas setelah awal sesi |
-| Benign | VRAM ≤ kuota, tidak melewati ambang idle, sesi aktif ≤ batas |
+| Benign | VRAM ≤ kuota, tidak melewati ambang idle, sesi aktif ≤ batas, tidak memenuhi pola R7 (median CPU ≥ 80% dan rata-rata GPU ≤ 60%) |
 
 Status lain: *gagal* (ada cek yang tidak terpenuhi), *tidak lengkap* (data
 untuk cek tidak ada, mis. Prometheus kosong atau sesi terlalu pendek), dan
@@ -284,9 +284,13 @@ besar, memori GPU tinggi hampir selalu berarti misuse dalam data ini.
   shard. Dulu tiap shard hanya dilatih satu kali lewat (puluhan step kecil),
   sehingga di GPU cepat job menjadi CPU-bound: di PC lab GPU 32–41% dengan
   CPU 1 core penuh dan baca disk ~400 MB/s terus-menerus, yang memenuhi
-  definisi R7. Setelah perbaikan (PC lab): GPU 91–93%, baca ~1,3 MB/s. Dip
-  saat loading (~0,1 s per shard) terlalu singkat untuk terlihat di sampel
-  5 s.
+  definisi R7. Setelah perbaikan, di dataset v3 (PC lab, 49 sesi) GPU
+  bergantung batch: 128 → 91–93%, 256 → 97–98%, tetapi 64 → 55–59% dengan CPU
+  98% (step terbatas kecepatan launch kernel), yang masih memenuhi definisi R7.
+  Ke-16 sesi seperti itu (15 batch 64 + `benign_cnn_training_0154`) dikeluarkan
+  dari `dataset_verified.csv` lewat cek benign `bukan_pola_R7`, dan batch 64
+  dihapus untuk run berikutnya. Baca disk median ~2 MB/s. Dip saat loading
+  (~0,1 s per shard) terlalu singkat untuk terlihat di sampel 5 s.
 - **Rujukan:** [CLOUDX26] W1; [GAO24]: operasi data adalah penyebab umum
   utilisasi GPU rendah. Di sini menjadi pembanding sah untuk R1 dan R7.
 
