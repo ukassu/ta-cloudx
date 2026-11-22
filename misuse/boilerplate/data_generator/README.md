@@ -13,7 +13,7 @@ data_generator/
 ├── telemetry_logger.py        # perekam CPU/mem/GPU/IO -> CSV
 ├── job_runner.py              # jalankan 1 sesi dari Scenario + rekam
 ├── run_experiment.py          # orchestrator config-driven
-└── scenarios/                  # 15 skenario, lihat tabel taksonomi di bawah
+└── scenarios/                  # 17 skenario, lihat tabel taksonomi di bawah
     └── template_new_scenario.py   # <- salin file ini untuk misuse baru (tidak ikut dijalankan)
 ```
 
@@ -31,7 +31,9 @@ untuk detector.
 | benign_interactive_gpu_notebook | BENIGN | - | burst per cell + jeda berpikir | antrean 0-1, 0-1 sesi paralel |
 | benign_data_pipeline_training | BENIGN | - | baca shard dari disk, dip GPU saat data loading | antrean 0-2 |
 | benign_batch_inference | BENIGN | - | burst GPU per batch, tulis prediksi opsional | antrean 0-1 |
+| benign_model_resident_notebook | BENIGN | - | model 50-85% kuota sesi tertahan di VRAM, cell inferensi/CPU + jeda berpikir | antrean 1-3, 0-1 sesi paralel |
 | misuse_idle_hoarding | R1 | K2 | VRAM 50-85% kuota sesi ditahan, util ~0, keep-alive | antrean 1-3 |
+| misuse_disguised_hoarding | R1 | K2 | VRAM 50-85% kuota sesi ditahan, aktivitas dan burst kernel palsu (≤ 21% waktu) | antrean 1-3 |
 | misuse_idle_session | R2 | K2 | aktif 10-35% awal sesi lalu kernel idle melewati ambang idle | antrean 0-1 |
 | misuse_quota_exceed | R3 | K2 | VRAM 1.3-1.8x `quota_mem_mb` sesi | antrean 0-1 |
 | misuse_overprovisioning | R4 | K1 | request 4-8 CPU / 3-4 GiB, pakai < 0.5 core | - |
@@ -192,6 +194,7 @@ Konfigurasi lewat environment variable:
 | `PROM_REQUIRED` | `false` | `true` = sesi yang tetap tanpa metrik Prometheus setelah 3 percobaan dicatat gagal (`.failed.json`) dan diulang `--resume` |
 | `K8S_REQUEST_GPU` | `false` | `true` = container job meminta `nvidia.com/gpu: 1`, sidecar membaca `nvidia-smi` |
 | `JOB_IMAGE` | `local/data-generator-job:latest` | pakai `local/data-generator-job:gpu` (torch CUDA) saat mode GPU |
+| `IO_SOURCE` | `auto` | sumber `io_read_mb`/`io_write_mb` sidecar: `psutil` (per proses, `/proc/<pid>/io`), `cgroup` (`io.stat` container job), atau `auto` (psutil bila kernel mendukung). `data-v3-20261107` direkam di kernel WSL2 6.18.54.1 (tanpa `/proc/<pid>/io`, jadi cgroup); kernel PC lab sekarang (6.18.58.1) membuat `auto` memilih psutil, yang nilainya lebih besar. Sesi pelengkap v3 harus memakai `IO_SOURCE=cgroup` |
 | `CODE_SOURCE` | `configmap` | kode skenario/sidecar dikirim lewat ConfigMap `data-generator-code` dan di-mount ke `/app`; `image` = pakai kode yang dibake di image |
 
 Dengan `CODE_SOURCE=configmap` image cukup berisi dependency: mengubah
@@ -237,6 +240,7 @@ kernel WSL2 6.18 di PC lab) membuat psutil tidak punya `io_counters()`. Di
 kernel seperti itu sidecar mengisi `io_read_mb`/`io_write_mb` dari `io.stat`
 cgroup container `job` (byte kumulatif yang sampai ke storage, sumber yang sama
 dengan cAdvisor), dan log sidecar menyebut `sumber io: cgroup io.stat`.
+`IO_SOURCE=cgroup` memaksa sumber ini walau kernel punya `/proc/<pid>/io`.
 
 `gpu_util_pct` dan `gpu_mem_util_pct` adalah rata-rata bacaan nvidia-smi
 tiap 200 ms selama interval sampling (bukan satu bacaan sesaat);
@@ -246,6 +250,40 @@ interval itu. Alasannya: `utilization.gpu` hanya mencakup jendela pendek
 berperiode. Uji di PC lab: beban duty 74% (siklus 1 s) terbaca 96% dengan
 satu bacaan vs 70% dengan rata-rata; burst 0,3 s tiap 5 s (6%) terbaca 0%
 vs 5,7%.
+
+### Metrik tools supporting (OTel, Inspektor Gadget, NetObserv)
+
+Kolom `prom_*` hanya berasal dari cAdvisor dan kube-state-metrics. Metrik
+tools supporting lain tidak masuk `dataset.csv`; ambil terpisah dengan
+`fetch_supporting_metrics.py` selagi datanya masih ada di Prometheus
+(retensi 10 hari, dan TSDB-nya emptyDir yang hilang saat `down-all.sh`):
+
+```bash
+python fetch_supporting_metrics.py <out_dir>   # PROMETHEUS_URL sama seperti saat run
+```
+
+Hasilnya ditulis ke `<out_dir>` tanpa mengubah `dataset.csv`:
+
+```text
+supporting_metrics.csv           # kolom otel_*, host_*, ig_* pada grid <session_id>.prometheus.csv
+dataset_extended.csv             # dataset.csv + kolom supporting (sampel terdekat)
+supporting_netobserv_flows.csv   # flow NetObserv per pasangan namespace selama run
+```
+
+Kolom `otel_*` berasal dari receiver kubeletstats (per Pod dan per
+container). Kolom `host_*` (hostmetrics) dan `ig_*` (latensi block I/O dari
+Inspektor Gadget) berlevel host, karena semua node k0s berbagi satu kernel.
+Analisisnya ada di `eda_supporting_metrics.ipynb`.
+
+Run `data-v3-20261107` diambil dari arsip TSDB di
+`data-v3-20261107-prometheus-tsdb/` (salinan emptyDir Prometheus dari
+node-2, diambil saat cluster mati), yang disajikan Prometheus lokal:
+
+```bash
+./prometheus_archive.sh serve data-v3-20261107-prometheus-tsdb   # http://127.0.0.1:19090
+PROMETHEUS_URL=http://127.0.0.1:19090 python fetch_supporting_metrics.py data-v3-20261107
+./prometheus_archive.sh stop
+```
 
 ## Metadata tambahan per skenario
 

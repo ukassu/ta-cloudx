@@ -16,7 +16,8 @@ RAM biasa (skenario memakai torch.zeros agar halaman memori benar-benar
 terpakai), sehingga tetap tertangkap oleh kolom mem_rss_mb.
 
 io_read_mb/io_write_mb dari psutil io_counters(); di kernel tanpa /proc/<pid>/io
-(mis. WSL2 6.18) diambil dari io.stat cgroup container job (lihat HAS_PROC_IO).
+(mis. WSL2 6.18.54.1) diambil dari io.stat cgroup container job (lihat HAS_PROC_IO).
+IO_SOURCE=cgroup memaksa sumber cgroup walau kernel punya /proc/<pid>/io.
 
 gpu_util_pct/gpu_mem_util_pct = rata-rata bacaan nvidia-smi tiap 200 ms selama
 interval sampling (GpuSampler), bukan satu bacaan sesaat: utilization.gpu hanya
@@ -35,7 +36,7 @@ Kolom konteks sesi (Kajian CATS, indikator R1/R2/R3):
 
 Environment variables (diisi dari Pod spec):
   SESSION_ID, LABEL, JOB_TYPE, JOB_CMD_MATCH, INTERVAL_SEC, GPU_REQUESTED,
-  ACTIVITY_FILE, EXTRA_META_JSON (lihat k8s_job_runner.py)
+  ACTIVITY_FILE, EXTRA_META_JSON, IO_SOURCE (lihat k8s_job_runner.py)
 """
 
 import csv
@@ -185,9 +186,20 @@ def _process(pid):
     return proc
 
 
-# Kernel tanpa CONFIG_TASK_IO_ACCOUNTING (mis. kernel WSL2 6.18 di PC lab) tidak
+# Kernel tanpa CONFIG_TASK_IO_ACCOUNTING (mis. kernel WSL2 6.18.54.1 di PC lab) tidak
 # punya /proc/<pid>/io, sehingga psutil tidak menyediakan Process.io_counters().
 HAS_PROC_IO = hasattr(psutil.Process, "io_counters")
+# IO_SOURCE: auto (psutil bila tersedia, selain itu cgroup), psutil, atau cgroup.
+# Kedua sumber tidak setara (psutil: per proses yang masih hidup, dihitung saat
+# halaman ditulis; cgroup: kumulatif container, dihitung saat sampai ke storage),
+# jadi satu dataset harus memakai satu sumber. data-v3-20261107 direkam di kernel
+# 6.18.54.1 (auto -> cgroup); kernel 6.18.58.1 punya /proc/<pid>/io (auto -> psutil).
+IO_SOURCE = os.environ.get("IO_SOURCE", "auto")
+if IO_SOURCE not in ("auto", "psutil", "cgroup"):
+    raise SystemExit(f"IO_SOURCE harus auto, psutil, atau cgroup, dapat '{IO_SOURCE}'")
+if IO_SOURCE == "psutil" and not HAS_PROC_IO:
+    raise SystemExit("IO_SOURCE=psutil, tapi kernel ini tidak punya /proc/<pid>/io")
+USE_PROC_IO = HAS_PROC_IO if IO_SOURCE == "auto" else IO_SOURCE == "psutil"
 
 
 def get_cgroup_io_mb(pid):
@@ -218,7 +230,7 @@ def get_process_cpu_mem_io(pids):
             p = _process(pid)
             cpu_pct += p.cpu_percent(interval=None)
             mem_rss_mb += p.memory_info().rss / (1024 ** 2)
-            if HAS_PROC_IO:
+            if USE_PROC_IO:
                 io = p.io_counters()
                 io_read_mb += io.read_bytes / (1024 ** 2)
                 io_write_mb += io.write_bytes / (1024 ** 2)
@@ -226,7 +238,7 @@ def get_process_cpu_mem_io(pids):
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             _PROCS.pop(pid, None)
             continue
-    if not HAS_PROC_IO:
+    if not USE_PROC_IO:
         # Semua proses job ada di cgroup container yang sama; pids[0] = proses root job
         io = get_cgroup_io_mb(pids[0]) if pids else None
         io_read_mb, io_write_mb = io if io else (None, None)
@@ -275,7 +287,8 @@ def main():
         sys.exit(1)
 
     print(f"[telemetry_sidecar] target ditemukan pid={root_pid}, mulai rekam "
-          f"(sumber io: {'psutil' if HAS_PROC_IO else 'cgroup io.stat'}).", flush=True)
+          f"(sumber io: {'psutil' if USE_PROC_IO else 'cgroup io.stat'}, "
+          f"IO_SOURCE={IO_SOURCE}).", flush=True)
 
     fieldnames = [
         "timestamp", "session_id", "label", "job_type",

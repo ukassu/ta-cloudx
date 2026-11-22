@@ -75,6 +75,8 @@ HOLD_FRAC = 0.9        # memori yang ditahan >= 90% param_hold_mem_mb
 OVERPROV_RATIO = 8     # R4: request CPU >= 8x pemakaian rata-rata
 BUSY_CPU_PCT = 80      # R7: median CPU ~1 core penuh
 LOW_GPU_PCT = 60       # R7: rata-rata utilisasi GPU rendah
+HOARD_MEAN_UTIL_PCT = 30  # R1 menyamar: rata-rata utilisasi palsu tetap rendah
+BURST_SEEN_PCT = 5     # burst GPU terekam: puncak di atas derau idle (data v3: 0-2%)
 HIGH_UTIL_PCT = 60     # S1: median utilisasi tinggi
 PERIOD_ACF = 0.3       # S1 berosilasi: autokorelasi pada periode yang disuntikkan
 NA = "n/a"             # cek tidak berlaku di mode ini (mis. kuota GPU di mode CPU)
@@ -129,7 +131,8 @@ def chk_gpu_unused(v):
 
 
 def chk_mem_held(v):
-    hold = _first(v.d, "param_hold_mem_mb")
+    # R1: memori yang ditahan; benign_model_resident_notebook: ukuran model
+    hold = _first(v.d, "param_hold_mem_mb") or _first(v.d, "param_model_mem_mb")
     mem = _col(v.steady, "gpu_mem_used_mb_device" if v.gpu_mode else "mem_rss_mb")
     if hold is None or mem is None:
         return None
@@ -237,6 +240,24 @@ def chk_not_r7(v):
     return not (busy and low)
 
 
+def chk_gpu_mean_low(v):
+    """R1 menyamar: burst palsu boleh terlihat, tetapi rata-rata utilisasi tetap rendah."""
+    if not v.gpu_mode:
+        return NA
+    s = _col(v.steady, "gpu_util_pct")
+    return None if s is None else bool(s.mean() <= HOARD_MEAN_UTIL_PCT)
+
+
+def chk_gpu_burst_seen(v):
+    """Minimal satu burst GPU terekam setelah fase awal (kernel palsu R1 menyamar,
+    cell model benign). Pemakaian yang hanya ada di fase awal tidak dihitung: sesi
+    benign seperti itu tampak persis seperti R1 polos."""
+    if not v.gpu_mode:
+        return NA
+    s = _col(v.steady, "gpu_util_pct")
+    return None if s is None else bool(s.max() > BURST_SEEN_PCT)
+
+
 def chk_high_load(v):
     s = v.util()
     return None if s is None else bool(s.median() >= HIGH_UTIL_PCT)
@@ -272,6 +293,15 @@ GT_CHECKS_BY_JOB = {
     # beban rata-ratanya tidak harus tinggi; yang dicek periodisitasnya
     "misuse_disguised_pattern": {"pola_periodik": chk_periodic,
                                  "tanpa_aktivitas_lanjutan": chk_no_later_activity},
+    # R1 menyamar: utilisasi sengaja tidak nol, jadi "p90 <= 10%" diganti rata-rata rendah
+    "misuse_disguised_hoarding": {"gpu_rata2_rendah": chk_gpu_mean_low,
+                                  "burst_palsu_terekam": chk_gpu_burst_seen,
+                                  "memori_tertahan": chk_mem_held,
+                                  "di_bawah_kuota": chk_within_quota, "ada_antrean": chk_queue,
+                                  "tidak_melewati_idle": chk_not_idle},
+    # benign + sifat yang menjadikannya pembanding R1: VRAM besar tertahan, model dipakai
+    "benign_model_resident_notebook": {**GT_CHECKS["BENIGN"], "memori_tertahan": chk_mem_held,
+                                       "model_dipakai": chk_gpu_burst_seen},
 }
 
 

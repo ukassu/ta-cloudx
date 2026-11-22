@@ -39,6 +39,7 @@ Status terhadap Kajian:
 | Skenario | Kode | Kelas | Status | Rujukan |
 |---|---|---|---|---|
 | `misuse_idle_hoarding` | R1 | K2 | Sesuai | [JEON19], [WENG22], [CARVER25] |
+| `misuse_disguised_hoarding` | R1 | K2 | Sesuai (varian perluasan) | [KEEPGPU], [JEON19], [WENG22] |
 | `misuse_idle_session` | R2 | K2 | Sesuai; ambang idle belum dari CloudX | [JH-CULL], [CARVER25] |
 | `misuse_quota_exceed` | R3 | K2 | Berbeda | [K8S-RQ], [CLOUDX26], [NV-TS] |
 | `misuse_overprovisioning` | R4 | K1 | Sebagian | [RZADCA20] |
@@ -52,11 +53,14 @@ Status terhadap Kajian:
 | `benign_data_pipeline_training` | BENIGN | - | Asumsi | [CLOUDX26] W1, [GAO24] |
 | `benign_batch_inference` | BENIGN | - | Asumsi | [CLOUDX26] W2 |
 | `benign_interactive_gpu_notebook` | BENIGN | - | Asumsi | [CARVER25] |
+| `benign_model_resident_notebook` | BENIGN | - | Asumsi | [CLOUDX26] W2, [CARVER25] |
 | `benign_eda_notebook` | BENIGN | - | Asumsi | [CLOUDX26] W3 |
 
 Skenario prioritas Kajian (Bagian 5): R1, R2, R3, R6, P5, S1. R2, R5, dan
 `benign_interactive_gpu_notebook` belum punya rujukan paper peer-review;
-rujukannya berupa dokumentasi, preprint, atau laporan industri.
+rujukannya berupa dokumentasi, preprint, atau laporan industri. Begitu pula
+penyamaran pada `misuse_disguised_hoarding`: R1-nya didukung paper, tetapi
+teknik penyamarannya hanya didukung dokumentasi tool [KEEPGPU].
 
 ## Cek ground truth
 
@@ -68,7 +72,8 @@ didefinisikan di bagian atas cek ground truth di `validate_dataset.py`.
 
 | Skenario | Sesi lolos bila |
 |---|---|
-| R1 | GPU tidak dipakai (p90 utilisasi ≤ 10%), memori tertahan ≥ 90% `param_hold_mem_mb`, VRAM ≤ kuota, antrean > 0, tidak melewati ambang idle |
+| R1 `idle_hoarding` | GPU tidak dipakai (p90 utilisasi ≤ 10%), memori tertahan ≥ 90% `param_hold_mem_mb`, VRAM ≤ kuota, antrean > 0, tidak melewati ambang idle |
+| R1 `disguised_hoarding` | rata-rata utilisasi GPU ≤ 30%, minimal satu burst terekam (utilisasi > 10%), memori tertahan ≥ 90% `param_hold_mem_mb`, VRAM ≤ kuota, antrean > 0, tidak melewati ambang idle |
 | R2 | `last_activity_age_sec` melewati ambang idle |
 | R3 | VRAM melewati kuota |
 | R4 | request CPU ≥ 8x pemakaian rata-rata |
@@ -79,6 +84,7 @@ didefinisikan di bagian atas cek ground truth di `validate_dataset.py`.
 | S1 `synthetic_load` | median utilisasi ≥ 60%, tanpa aktivitas setelah awal sesi |
 | S1 `disguised_pattern` | autokorelasi utilisasi pada periode yang disuntikkan ≥ 0.3, tanpa aktivitas setelah awal sesi |
 | Benign | VRAM ≤ kuota, tidak melewati ambang idle, sesi aktif ≤ batas, tidak memenuhi pola R7 (median CPU ≥ 80% dan rata-rata GPU ≤ 60%) |
+| Benign `model_resident_notebook` | cek benign, ditambah memori tertahan ≥ 90% `param_model_mem_mb` dan minimal satu burst GPU terekam (model dipakai) |
 
 Status lain: *gagal* (ada cek yang tidak terpenuhi), *tidak lengkap* (data
 untuk cek tidak ada, mis. Prometheus kosong atau sesi terlalu pendek), dan
@@ -116,6 +122,47 @@ semua sesi:
 - **Asumsi:** VRAM ditahan 50–85% dari kuota sesi itu sendiri, sehingga
   tidak pernah melewati kuota (R1 terpisah dari R3); keep-alive 30–110 s
   (di bawah ambang idle, agar R1 terpisah dari R2).
+
+### R1 — `misuse_disguised_hoarding` (K2)
+
+- **Definisi Kajian:** sama dengan R1. Varian yang menyamarkan hoarding
+  tidak dijelaskan di Kajian, jadi ini perluasan.
+- **Implementasi:** menahan VRAM 50–85% kuota sesi (sama dengan R1 polos),
+  memalsukan aktivitas notebook tiap 10–60 s, dan menjalankan burst kernel
+  tanpa pekerjaan berguna selama 1–4 s tiap 15–60 s (porsi waktu burst
+  ≤ 21%). Mode `matmul` mengalikan matriks acak 1024–4096 yang terpisah dari
+  memori yang ditahan. Mode `held` menjalankan operasi elementwise pada
+  memori yang ditahan, sehingga utilisasi memori GPU ikut naik seperti saat
+  model dipakai. Opsional ada kerja CPU 0–2 s tiap aktivitas. `jitter` (0–1)
+  mengatur keteraturan jeda dan lama burst. Aktivitas dan burst dijadwalkan
+  terpisah, 1–3 Pod waiter mengantre GPU.
+- **Rujukan pendukung:** [KEEPGPU] adalah tool yang melakukan persis ini:
+  menahan tensor di VRAM dan menjalankan burst operasi CUDA berkala agar GPU
+  tidak direklamasi scheduler. Untuk R1-nya sendiri: [JEON19], [WENG22].
+- **Cek ground truth:** cek R1 polos (p90 utilisasi ≤ 10%) tidak cocok karena
+  utilisasi sengaja tidak nol, sehingga sesi dengan penyamaran terkuat akan
+  terbuang. Diganti rata-rata utilisasi ≤ 30% dan minimal satu burst > 5%
+  setelah 20 s pertama.
+- **Verifikasi (PC lab, sidecar asli di image job, sesi 150 s, tanpa
+  cluster):**
+
+  | Konfigurasi | Rata-rata GPU | p90 | Puncak | Utilisasi memori puncak |
+  |---|---|---|---|---|
+  | ringan: matmul 1024, burst 1 s tiap 60 s, jitter 0 | 1,2% | 0% | 16% | 1% |
+  | tengah: held, burst 2,5 s tiap 30 s, jitter 0,5 | 7,0% | 29% | 51% | 51% |
+  | berat: matmul 4096, burst 4 s tiap 15 s, jitter 1, CPU 2 s | 20,1% | 64% | 82% | 27% |
+
+  Semua lolos cek, kecuali `ada_antrean` yang butuh Prometheus (belum diuji
+  di cluster). Pembanding data v3: `misuse_idle_hoarding` 0%,
+  `benign_interactive_gpu_notebook` median 8,2%.
+- **Celah:** bedanya dengan benign ada di pola, bukan besaran. Mode
+  `matmul` punya utilisasi memori rendah dibanding utilisasi GPU, sedangkan
+  cell model benign membaca seluruh bobot (utilisasi memori ≈ utilisasi
+  GPU); mode `held` menghapus perbedaan ini. Resolusi 5 s membuat burst
+  < 5 s hanya muncul di satu sampel. Versi awal skenario ini (matmul
+  128–512 dengan sinkronisasi tiap iterasi) hanya menghasilkan 0,1–0,3%
+  utilisasi, praktis sama dengan R1 polos, dan pada konfigurasi terberat
+  gagal cek R1 (p90 17%).
 
 ### R2 — `misuse_idle_session` (K2)
 
@@ -265,6 +312,9 @@ dari evaluasi CloudX [CLOUDX26, Tabel 3]:
 Memori benign di generator berukuran tetap dan jauh lebih kecil daripada
 W1–W2 (audit v1: training sekitar 0.3 GB). Akibatnya, di GPU berkapasitas
 besar, memori GPU tinggi hampir selalu berarti misuse dalam data ini.
+Dataset v3 masih begitu: VRAM benign maksimum 3,0 GB, sedangkan R1 menahan
+4,2–9,3 GB. `benign_model_resident_notebook` (ditambahkan setelah v3)
+menutup celah ini untuk R1.
 
 ### `benign_cnn_training`
 
@@ -310,6 +360,32 @@ besar, memori GPU tinggi hampir selalu berarti misuse dalam data ini.
 - **Rujukan:** [CARVER25]: pemakaian GPU di sesi notebook bersifat
   intermiten.
 - **Asumsi:** jeda berpikir maksimum 20–100 s, di bawah ambang idle.
+
+### `benign_model_resident_notebook`
+
+- **Pola:** model sebesar 50–85% kuota sesi tertahan di VRAM, sama dengan
+  R1. Cell `infer` (forward atas seluruh bobot, batch 1–64), `cpu` (numpy),
+  dan `inspect` diselingi jeda berpikir 5 s hingga 30–90 s. Model dipakai
+  lagi di cell berikutnya bila sudah 30 s tidak dipakai. Antrean 1–3 seperti
+  R1. Pembanding sulit untuk R1, terutama `misuse_disguised_hoarding`.
+- **Rujukan:** [CLOUDX26] W2 (inferensi BERT-base, ~3,1 GB VRAM);
+  [CARVER25]: pemakaian GPU di sesi notebook bersifat intermiten.
+- **Asumsi:** bobot dibuat acak langsung di GPU, tanpa membaca checkpoint
+  dari disk (R1 juga mengalokasikan memorinya tanpa disk). Ukuran model
+  mengikuti kuota, bukan model nyata tertentu.
+- **Verifikasi (PC lab, sidecar asli di image job, sesi 150 s):** ringan
+  (model 4,1 GB, lebar 2048, jeda ≤ 90 s, cell ≤ 5 s): rata-rata GPU 6,7%,
+  puncak 63%, utilisasi memori puncak 53%. Berat (6,9 GB, lebar 8192, jeda
+  ≤ 30 s, cell ≤ 20 s): rata-rata 22,1%, p90 99%, median CPU 0,2% (bukan
+  pola R7). Semua cek benign lolos, kecuali `sesi_dalam_batas` yang butuh
+  Prometheus.
+- **Celah yang sudah ditangani:** versi awal tanpa aturan pemakaian berkala
+  menghasilkan sesi yang setelah 20 s pertama identik dengan R1 polos (GPU
+  0% selama 130 s). Menurut simulasi jadwal cell, itu terjadi pada 31% sesi
+  90 s; dengan aturan 30 s menjadi 3,6% (sesi 90 s) dan 0% (≥ 150 s), dan
+  sisanya tersaring cek `model_dipakai`. Cell dan jeda dipotong ke sisa
+  durasi, karena tanpa itu sesi bisa molor hingga 110 s dan melewati
+  timeout runner.
 
 ### `benign_eda_notebook`
 
@@ -392,6 +468,10 @@ teknis), **laporan** (laporan industri), **internal** (dokumen tim).
 - **[KOOMEY15]** (laporan) Koomey, J., & Taylor, J. (2015). Studi server
   "comatose" (Anthesis Group, data TSO Logic).
   <https://www.anthesisgroup.com/report-finds-that-thirty-per-cent-of-servers-are-comatose/>
+- **[KEEPGPU]** (dok) KeepGPU: tool yang menahan tensor di VRAM dan
+  menjalankan burst operasi CUDA berkala agar GPU di cluster bersama tidak
+  direklamasi. <https://pypi.org/project/keep-gpu/>,
+  <https://keepgpu.readthedocs.io/>
 - **[REISS12]** (paper) Reiss, C., Tumanov, A., Ganger, G. R., Katz, R.
   H., & Kozuch, M. A. (2012). Heterogeneity and Dynamicity of Clouds at
   Scale: Google Trace Analysis. *SoCC '12*.

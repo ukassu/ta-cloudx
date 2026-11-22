@@ -372,6 +372,8 @@ def build_pod_manifest(scenario: Scenario, session_id: str, args: list,
             {"name": "GPU_REQUESTED", "value": "1" if request_gpu else "0"},
             {"name": "ACTIVITY_FILE", "value": ACTIVITY_FILE},
             {"name": "EXTRA_META_JSON", "value": json.dumps(extra_meta or {})},
+            # sumber io_read_mb/io_write_mb; run_experiment mengisinya dari plan.json
+            {"name": "IO_SOURCE", "value": os.environ.get("IO_SOURCE", "auto")},
         ],
         "volumeMounts": [{"name": "shared-data", "mountPath": "/data"}] + _code_mounts(),
     }
